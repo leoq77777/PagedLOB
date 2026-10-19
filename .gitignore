@@ -1,0 +1,30 @@
+# Build trees
+build/
+build-*/
+cmake-build-*/
+.cache/
+compile_commands.json
+CMakeUserPresets.json
+
+# Local / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Objects / bindings
+*.o
+*.a
+*.so
+*.dylib
+*.pyc
+__pycache__/
+.venv/
+*.egg-info/
+
+# Project prep docs (local only — not published)
+docs/
+proposal.md
+proposal-v2.md
+tutorial.md
+zqr core.md
