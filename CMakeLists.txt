@@ -79,6 +79,7 @@ if(FASTLOB_BUILD_TESTS)
     tests/zero_alloc_hotpath_test.cpp
     tests/execution_sim_test.cpp
     tests/replay_test.cpp
+    tests/price_index_diff_test.cpp
   )
   target_link_libraries(fastlob_tests PRIVATE fastlob fastlob_alloc_probe GTest::gtest_main)
   fastlob_apply_warnings(fastlob_tests)
@@ -95,6 +96,10 @@ if(FASTLOB_BUILD_BENCH)
   add_executable(fastlob_latency_hist bench/latency_hist.cpp)
   target_link_libraries(fastlob_latency_hist PRIVATE fastlob)
   fastlob_apply_warnings(fastlob_latency_hist)
+
+  add_executable(price_index_bench bench/price_index_bench.cpp)
+  target_link_libraries(price_index_bench PRIVATE fastlob)
+  fastlob_apply_warnings(price_index_bench)
 endif()
 
 if(FASTLOB_BUILD_PYTHON)
