@@ -100,6 +100,97 @@ if(FASTLOB_BUILD_BENCH)
   add_executable(price_index_bench bench/price_index_bench.cpp)
   target_link_libraries(price_index_bench PRIVATE fastlob)
   fastlob_apply_warnings(price_index_bench)
+
+  # Bench-only third-party books. The core fastlob target does not see them.
+  FetchContent_Declare(
+    liquibook
+    GIT_REPOSITORY https://github.com/enewhuis/liquibook.git
+    GIT_TAG 2427613b32f1667abae68a01df6af9ba8270f8e7
+  )
+  FetchContent_Declare(
+    tzadiko_orderbook
+    GIT_REPOSITORY https://github.com/Tzadiko/Orderbook.git
+    GIT_TAG dd136dd219ead95796f0e396e9e1395542bf673f
+  )
+  FetchContent_Declare(
+    br_orderbook
+    GIT_REPOSITORY https://github.com/brprojects/Limit-Order-Book.git
+    GIT_TAG af6e5349874649fe196bd6c26653d357f5a751f2
+  )
+  FetchContent_GetProperties(liquibook)
+  if(NOT liquibook_POPULATED)
+    FetchContent_Populate(liquibook)
+  endif()
+  FetchContent_GetProperties(tzadiko_orderbook)
+  if(NOT tzadiko_orderbook_POPULATED)
+    FetchContent_Populate(tzadiko_orderbook)
+  endif()
+  # GCC treats '_' as a real name, so two structured bindings in one block fail.
+  file(READ "${tzadiko_orderbook_SOURCE_DIR}/Orderbook.cpp" FASTLOB_TZ_SRC)
+  string(REPLACE "const auto& [order, _] = entry;"
+                 "const auto& [order, location] = entry;"
+                 FASTLOB_TZ_SRC "${FASTLOB_TZ_SRC}")
+  file(WRITE "${tzadiko_orderbook_SOURCE_DIR}/Orderbook.cpp" "${FASTLOB_TZ_SRC}")
+  FetchContent_GetProperties(br_orderbook)
+  if(NOT br_orderbook_POPULATED)
+    FetchContent_Populate(br_orderbook)
+  endif()
+
+  set(FASTLOB_VENDOR_SOURCES
+    ${liquibook_SOURCE_DIR}/src/simple/simple_order.cpp
+    ${tzadiko_orderbook_SOURCE_DIR}/Orderbook.cpp
+    ${br_orderbook_SOURCE_DIR}/Limit_Order_Book/Book.cpp
+    ${br_orderbook_SOURCE_DIR}/Limit_Order_Book/Limit.cpp
+    ${br_orderbook_SOURCE_DIR}/Limit_Order_Book/Order.cpp
+  )
+  set(FASTLOB_EXTERNAL_SOURCES
+    ${FASTLOB_VENDOR_SOURCES}
+    bench/external/run_fastlob.cpp
+    bench/external/run_liquibook.cpp
+    bench/external/run_tzadiko.cpp
+    bench/external/run_br.cpp
+  )
+  set_source_files_properties(
+    ${liquibook_SOURCE_DIR}/src/simple/simple_order.cpp
+    ${br_orderbook_SOURCE_DIR}/Limit_Order_Book/Book.cpp
+    ${br_orderbook_SOURCE_DIR}/Limit_Order_Book/Limit.cpp
+    ${br_orderbook_SOURCE_DIR}/Limit_Order_Book/Order.cpp
+    PROPERTIES COMPILE_OPTIONS "-w")
+  set_source_files_properties(${tzadiko_orderbook_SOURCE_DIR}/Orderbook.cpp PROPERTIES
+    COMPILE_OPTIONS "-w;-include;${CMAKE_SOURCE_DIR}/bench/external/tzadiko_posix.h")
+
+  add_executable(external_compare_bench
+    bench/external_compare_bench.cpp
+    ${FASTLOB_EXTERNAL_SOURCES})
+  target_link_libraries(external_compare_bench PRIVATE fastlob)
+  target_include_directories(external_compare_bench PRIVATE
+    ${CMAKE_SOURCE_DIR}/bench
+    ${CMAKE_SOURCE_DIR}/bench/external
+    ${liquibook_SOURCE_DIR}/src
+    ${tzadiko_orderbook_SOURCE_DIR}
+    ${br_orderbook_SOURCE_DIR}/Limit_Order_Book)
+  fastlob_apply_warnings(external_compare_bench)
+  if(NOT WIN32)
+    target_link_libraries(external_compare_bench PRIVATE pthread)
+  endif()
+
+  if(FASTLOB_BUILD_TESTS)
+    add_executable(external_book_tests
+      tests/external_liquibook_test.cpp
+      tests/external_tzadiko_test.cpp
+      tests/external_br_test.cpp
+      ${FASTLOB_VENDOR_SOURCES})
+    target_link_libraries(external_book_tests PRIVATE fastlob GTest::gtest_main pthread)
+    target_include_directories(external_book_tests PRIVATE
+      ${CMAKE_SOURCE_DIR}
+      ${CMAKE_SOURCE_DIR}/tests
+      ${CMAKE_SOURCE_DIR}/bench/external
+      ${liquibook_SOURCE_DIR}/src
+      ${tzadiko_orderbook_SOURCE_DIR}
+      ${br_orderbook_SOURCE_DIR}/Limit_Order_Book)
+    fastlob_apply_warnings(external_book_tests)
+    gtest_discover_tests(external_book_tests)
+  endif()
 endif()
 
 if(FASTLOB_BUILD_PYTHON)
