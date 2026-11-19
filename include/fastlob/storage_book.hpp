@@ -12,14 +12,15 @@
 //   - FastOrderBook (v1) is a separate type and is not modified
 //   - the price index: MapPriceIndex versus PagedPriceIndex
 //
-// Order objects stay pointer-linked like v1. The proposal's 32-bit order
-// handles belong with elastic slabs and are not part of this step. Level
-// identity inside a price index is a 32-bit handle into LevelPool.
+// Order objects stay pointer-linked like v1. Each Order stores a 32-bit
+// LevelPool handle so cancel/execute/match do not look the price up again.
+// 32-bit order handles belong with elastic slabs and are not part of this step.
 
 #include "fastlob/map_price_index.hpp"
 #include "fastlob/memory_pool.hpp"
 #include "fastlob/paged_price_index.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -83,12 +84,28 @@ public:
         order->qty = qty;
         order->side = side;
         order->timestamp = ts;
+        order->level_handle = levels_.handle_of(level);
         order->prev = nullptr;
         order->next = nullptr;
         fifo_push(*level, order);
         ids_.insert(id, order);
         ++order_count_;
         return true;
+    }
+
+    /// Cross the opposite side at the maker price, then rest any remainder.
+    /// Does not run inside apply(); MBO replay stays event-faithful.
+    MatchResult match_limit(OrderId id, Side side, Price price, Qty qty, Timestamp ts = 0,
+                            std::vector<Fill>* fills = nullptr) {
+        return match_incoming(id, side, price, qty, /*market=*/false, ts, fills);
+    }
+
+    /// Walk the opposite side until qty is gone or the book is empty. Remainder does not rest.
+    MatchResult match_market(OrderId id, Side side, Qty qty, Timestamp ts = 0,
+                             std::vector<Fill>* fills = nullptr) {
+        const Price cap = side == Side::Buy ? std::numeric_limits<Price>::max()
+                                            : std::numeric_limits<Price>::min();
+        return match_incoming(id, side, cap, qty, /*market=*/true, ts, fills);
     }
 
     bool cancel(OrderId id) {
@@ -113,8 +130,7 @@ public:
         if (new_qty > order->qty) {
             return false;
         }
-        BookLevel* level = side_index(order->side).find(order->price);
-        assert(level != nullptr);
+        BookLevel* level = level_of(order);
         level->total_qty -= static_cast<std::uint64_t>(order->qty - new_qty);
         order->qty = new_qty;
         return true;
@@ -125,20 +141,7 @@ public:
         if (order == nullptr || exec_qty == 0 || exec_qty > order->qty) {
             return false;
         }
-        const Side side = order->side;
-        BookLevel* level = side_index(side).find(order->price);
-        assert(level != nullptr);
-        order->qty -= exec_qty;
-        level->total_qty -= exec_qty;
-        if (order->qty == 0) {
-            fifo_unlink(*level, order);
-            ids_.erase(id);
-            pool_.deallocate(order);
-            --order_count_;
-            if (level->head == nullptr) {
-                side_index(side).close(level);
-            }
-        }
+        apply_fill(order, exec_qty);
         return true;
     }
 
@@ -206,18 +209,84 @@ public:
 
     [[nodiscard]] PageStats page_stats() const { return bids_.stats() + asks_.stats(); }
 
+    [[nodiscard]] std::optional<Price> best_price(Side side) const {
+        const BookLevel* level = side_index(side).best();
+        if (level == nullptr) {
+            return std::nullopt;
+        }
+        return level->price;
+    }
+
 private:
+    static bool crosses(Side taker, Price taker_px, Price maker_px) {
+        return taker == Side::Buy ? taker_px >= maker_px : taker_px <= maker_px;
+    }
+
+    [[nodiscard]] BookLevel* level_of(Order* order) {
+        assert(order != nullptr && order->level_handle != 0);
+        return levels_.get(order->level_handle);
+    }
+
+    void apply_fill(Order* maker, Qty take) {
+        BookLevel* level = level_of(maker);
+        assert(maker->qty >= take);
+        assert(level->total_qty >= take);
+        maker->qty -= take;
+        level->total_qty -= take;
+        if (maker->qty == 0) {
+            const Side side = maker->side;
+            fifo_unlink(*level, maker);
+            ids_.erase(maker->order_id);
+            pool_.deallocate(maker);
+            --order_count_;
+            if (level->head == nullptr) {
+                side_index(side).close(level);
+            }
+        }
+    }
+
+    MatchResult match_incoming(OrderId id, Side side, Price price, Qty qty, bool market, Timestamp ts,
+                               std::vector<Fill>* fills) {
+        MatchResult result;
+        if (id == kInvalidOrderId || qty == 0 || ids_.find(id) != nullptr) {
+            return result;
+        }
+        result.ok = true;
+        result.remaining = qty;
+        PriceIndex& opposite = side_index(side == Side::Buy ? Side::Sell : Side::Buy);
+        while (result.remaining > 0) {
+            BookLevel* level = opposite.best();
+            if (level == nullptr) {
+                break;
+            }
+            if (!market && !crosses(side, price, level->price)) {
+                break;
+            }
+            Order* maker = level->head;
+            assert(maker != nullptr);
+            const Qty take = std::min(result.remaining, maker->qty);
+            if (fills != nullptr) {
+                fills->push_back(Fill{maker->order_id, id, level->price, take});
+            }
+            result.filled += take;
+            result.remaining -= take;
+            apply_fill(maker, take);
+        }
+        if (result.remaining > 0 && !market) {
+            result.rested = add(id, side, price, result.remaining, ts);
+            result.ok = result.rested;
+        }
+        return result;
+    }
+
     void remove_order(Order* order) {
+        BookLevel* level = level_of(order);
         const Side side = order->side;
-        const Price price = order->price;
-        const OrderId id = order->order_id;
         const Qty qty = order->qty;
-        BookLevel* level = side_index(side).find(price);
-        assert(level != nullptr);
         assert(level->total_qty >= qty);
         level->total_qty -= qty;
         fifo_unlink(*level, order);
-        ids_.erase(id);
+        ids_.erase(order->order_id);
         pool_.deallocate(order);
         --order_count_;
         if (level->head == nullptr) {

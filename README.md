@@ -12,7 +12,7 @@ Synthetic MBO  →  Replay (same-thread)  →  Reference / v1 / PagedLOB  →  S
 
 - **Reference LOB**: `std::map` + `std::list` gold standard
 - **FastOrderBook (v1)**: fixed order pool + intrusive FIFO + hash price index + sorted level list
-- **PagedLOB**: same order path; price directory is `2^PageBits` ticks per leaf (default `PageBits=8`, 256 ticks)
+- **PagedLOB**: same order path; price directory is `2^PageBits` ticks per leaf (default `PageBits=8`, 256 ticks). `match_limit` / `match_market` walk `best_` and the FIFO; `apply()` still does not match (MBO replay).
 - **Execution Simulator**: shadow limits (never enter the public FIFO) + market VWAP; currently wired to v1
 - **SPSC**: not part of MVP
 

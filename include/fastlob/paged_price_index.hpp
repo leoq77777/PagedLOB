@@ -245,6 +245,7 @@ public:
     [[nodiscard]] std::size_t live_bytes() const { return stats().live_bytes; }
     [[nodiscard]] std::size_t peak_bytes() const { return committed_bytes(); }
     [[nodiscard]] std::size_t active() const { return active_; }
+    [[nodiscard]] BookLevel* best() const { return best_; }
     [[nodiscard]] PageStats stats() const {
         PageStats s;
         s.committed_nodes = created_nodes_;

@@ -141,6 +141,7 @@ public:
     [[nodiscard]] std::size_t live_bytes() const { return counter_.live; }
     [[nodiscard]] std::size_t peak_bytes() const { return counter_.peak; }
     [[nodiscard]] std::size_t active() const { return active_; }
+    [[nodiscard]] BookLevel* best() const { return best_; }
 
 private:
     static Qty narrow_qty(std::uint64_t qty) {

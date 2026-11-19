@@ -54,6 +54,9 @@ public:
     bool add(std::uint64_t id, bool buy, std::int64_t price, std::uint32_t qty) {
         return book_.add(id, buy ? fastlob::Side::Buy : fastlob::Side::Sell, price, qty);
     }
+    bool match(std::uint64_t id, bool buy, std::int64_t price, std::uint32_t qty) {
+        return book_.match_limit(id, buy ? fastlob::Side::Buy : fastlob::Side::Sell, price, qty).ok;
+    }
     bool cancel(std::uint64_t id) { return book_.cancel(id); }
 
     std::uint64_t sweep_bids() {

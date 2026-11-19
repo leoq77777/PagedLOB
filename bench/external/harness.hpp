@@ -265,6 +265,62 @@ void bench_sparse(const char* name) {
 }
 
 template <typename Book>
+void bench_match_touch(const char* name) {
+    std::uint64_t next = 10;
+    bench_measure<Book>(
+        "match_touch", name, "ns/match", 5, 2000, 64, 1 << 18, 32, false,
+        [&](Book& book) {
+            next = 10;
+            return book.add(1, false, 100, 1);
+        },
+        [&](Book& book) {
+            for (int i = 0; i < 32; ++i) {
+                const std::uint64_t taker = next++;
+                const std::uint64_t maker = next++;
+                bench_sink() += static_cast<std::uint64_t>(book.match(taker, true, 100, 1));
+                bench_sink() += static_cast<std::uint64_t>(book.add(maker, false, 100, 1));
+            }
+        });
+}
+
+template <typename Book>
+void bench_match_walk(const char* name) {
+    struct Window {
+        std::int64_t lo{1000};
+        std::int64_t hi{0};
+        std::uint64_t next{0};
+    };
+    Window window;
+    constexpr int kDepth = 64;
+    bench_measure<Book>(
+        "match_walk8", name, "ns/match", 5, 400, 16, 1 << 18, kDepth + 16, false,
+        [&](Book& book) {
+            window = {};
+            window.lo = 1000;
+            window.hi = 1000 + kDepth - 1;
+            window.next = static_cast<std::uint64_t>(kDepth + 1);
+            for (int i = 0; i < kDepth; ++i) {
+                if (!book.add(static_cast<std::uint64_t>(i + 1), false, 1000 + i, 1)) {
+                    return false;
+                }
+            }
+            return true;
+        },
+        [&](Book& book) {
+            for (int i = 0; i < 8; ++i) {
+                const bool filled = book.match(window.next++, true, window.hi, 1);
+                const bool restocked = book.add(window.next++, false, window.hi + 1, 1);
+                if (!filled || !restocked) {
+                    bench_failed() = true;
+                }
+                bench_sink() += static_cast<std::uint64_t>(filled) + static_cast<std::uint64_t>(restocked);
+                ++window.lo;
+                ++window.hi;
+            }
+        });
+}
+
+template <typename Book>
 void bench_all(const char* name) {
     bench_existing<Book>(name, false);
     bench_existing<Book>(name, true);
@@ -273,4 +329,6 @@ void bench_all(const char* name) {
     bench_sweep<Book>(name, "sweep_in_page", false);
     bench_sweep<Book>(name, "sweep_across", true);
     bench_sparse<Book>(name);
+    bench_match_touch<Book>(name);
+    bench_match_walk<Book>(name);
 }

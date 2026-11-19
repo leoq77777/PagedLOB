@@ -39,6 +39,20 @@ struct LevelView {
     Qty qty{0};
 };
 
+struct Fill {
+    OrderId maker_id{0};
+    OrderId taker_id{0};
+    Price price{0};
+    Qty qty{0};
+};
+
+struct MatchResult {
+    bool ok{false};
+    Qty filled{0};
+    Qty remaining{0};
+    bool rested{false};
+};
+
 inline constexpr OrderId kInvalidOrderId = 0;
 inline constexpr Price kInvalidPrice = std::numeric_limits<Price>::min();
 

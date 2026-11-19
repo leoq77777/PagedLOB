@@ -28,6 +28,10 @@ public:
         return true;
     }
 
+    bool match(std::uint64_t id, bool buy, std::int64_t price, std::uint32_t qty) {
+        return add(id, buy, price, qty);
+    }
+
     bool cancel(std::uint64_t id) {
         const auto it = orders_.find(id);
         if (it == orders_.end()) {

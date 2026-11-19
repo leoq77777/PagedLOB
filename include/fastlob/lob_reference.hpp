@@ -24,7 +24,7 @@ public:
             return false;
         }
         auto& level = levels(side)[price];
-        level.push_back(Order{id, price, qty, side, {}, nullptr, nullptr, ts});
+        level.push_back(Order{id, price, qty, 0, side, {}, nullptr, nullptr, ts});
         auto it = std::prev(level.end());
         index_[id] = Loc{side, price, it};
         return true;

@@ -23,6 +23,14 @@ public:
         return book_.searchOrderMap(static_cast<int>(id)) != nullptr;
     }
 
+    bool match(std::uint64_t id, bool buy, std::int64_t price, std::uint32_t qty) {
+        if (price <= 0 || qty == 0 || id > static_cast<std::uint64_t>(0x7fffffff)) {
+            return false;
+        }
+        book_.addLimitOrder(static_cast<int>(id), buy, static_cast<int>(qty), static_cast<int>(price));
+        return true;
+    }
+
     bool cancel(std::uint64_t id) {
         if (book_.searchOrderMap(static_cast<int>(id)) == nullptr) {
             return false;

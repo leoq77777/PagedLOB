@@ -13,6 +13,7 @@ struct Order {
     OrderId order_id{kInvalidOrderId};
     Price price{0};
     Qty qty{0};
+    std::uint32_t level_handle{0};  // LevelPool handle; 0 is null
     Side side{Side::Buy};
     std::uint8_t pad_[3]{};
     Order* prev{nullptr};

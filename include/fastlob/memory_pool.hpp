@@ -31,6 +31,7 @@ public:
         --free_count_;
         o->prev = nullptr;
         o->next = nullptr;
+        o->level_handle = 0;
         return o;
     }
 

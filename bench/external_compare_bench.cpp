@@ -36,7 +36,9 @@ int main() {
                  "alive. Includes allocator overhead. Not the same column as price_index_bench's "
                  "structural sizeof sums.\n";
     std::cout << "prices are positive and fit in int32. Price 0 is avoided (Liquibook market sentinel).\n";
-    std::cout << "matching engines are only fed non-crossing orders in these loops.\n";
+    std::cout << "exist/churn/sweep/sparse stay non-crossing. match_touch and match_walk8 go through "
+                 "each book's matching path (PagedLOB::match_limit; others match inside add).\n";
+    std::cout << "v1 is not in this harness.\n";
 
     run_fastlob();
     run_liquibook();
