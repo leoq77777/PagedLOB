@@ -22,8 +22,9 @@ __pycache__/
 .venv/
 *.egg-info/
 
-# Project prep docs (local only — not published)
-docs/
+# Local prep notes stay untracked. The architecture write-up is published.
+docs/*
+!docs/pagedlob-architecture.md
 proposal.md
 proposal-v2.md
 tutorial.md
