@@ -237,8 +237,10 @@ private:
 };
 
 using MapStorageBook = StorageBook<MapPriceIndex>;
-using PagedStorageBook = StorageBook<PagedPriceIndex>;
-/// Public name of the paged engine. Same type as PagedStorageBook.
+template <int PageBits = kDefaultPageBits>
+using PagedStorageBookT = StorageBook<PagedPriceIndex<PageBits>>;
+using PagedStorageBook = PagedStorageBookT<kDefaultPageBits>;
+/// Public name of the paged engine. Same type as PagedStorageBook (256-tick pages).
 using PagedLOB = PagedStorageBook;
 
 }  // namespace fastlob

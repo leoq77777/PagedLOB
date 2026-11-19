@@ -327,8 +327,8 @@ void print_table() {
                   << row.p50_sd << " | " << row.price_bytes << " | " << row.total_bytes << " |\n";
     }
     std::cout << "END_MD\n";
-    std::cout << "dir_node_bytes " << fastlob::PagedPriceIndex::dir_node_bytes() << "\n";
-    std::cout << "leaf_bytes " << fastlob::PagedPriceIndex::leaf_bytes() << "\n";
+    std::cout << "dir_node_bytes " << fastlob::PagedPriceIndex<8>::dir_node_bytes() << "\n";
+    std::cout << "leaf_bytes " << fastlob::PagedPriceIndex<8>::leaf_bytes() << "\n";
     std::cout << "sink " << g_sink << "\n";
 }
 

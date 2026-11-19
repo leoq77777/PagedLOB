@@ -15,25 +15,35 @@
 
 namespace fastlob {
 
-/// Occupancy-bitmap helpers for a 256-bit page or directory node.
-inline void occ_set(std::uint64_t occ[4], int bit) {
+/// Occupancy-bitmap helpers. Words is deduced from the array bound: 4 for an
+/// 8-bit radix node, (ticks / 64) for a leaf.
+template <int Words>
+inline void occ_set(std::uint64_t (&occ)[Words], int bit) {
     occ[bit >> 6] |= std::uint64_t{1} << (bit & 63);
 }
 
-inline void occ_clear(std::uint64_t occ[4], int bit) {
+template <int Words>
+inline void occ_clear(std::uint64_t (&occ)[Words], int bit) {
     occ[bit >> 6] &= ~(std::uint64_t{1} << (bit & 63));
 }
 
-inline bool occ_test(const std::uint64_t occ[4], int bit) {
+template <int Words>
+inline bool occ_test(const std::uint64_t (&occ)[Words], int bit) {
     return ((occ[bit >> 6] >> (bit & 63)) & 1U) != 0;
 }
 
-inline bool occ_any(const std::uint64_t occ[4]) {
-    return (occ[0] | occ[1] | occ[2] | occ[3]) != 0;
+template <int Words>
+inline bool occ_any(const std::uint64_t (&occ)[Words]) {
+    std::uint64_t u = 0;
+    for (int word = 0; word < Words; ++word) {
+        u |= occ[word];
+    }
+    return u != 0;
 }
 
-inline int occ_lowest(const std::uint64_t occ[4]) {
-    for (int word = 0; word < 4; ++word) {
+template <int Words>
+inline int occ_lowest(const std::uint64_t (&occ)[Words]) {
+    for (int word = 0; word < Words; ++word) {
         if (occ[word] != 0) {
             return (word << 6) + __builtin_ctzll(occ[word]);
         }
@@ -41,8 +51,9 @@ inline int occ_lowest(const std::uint64_t occ[4]) {
     return -1;
 }
 
-inline int occ_highest(const std::uint64_t occ[4]) {
-    for (int word = 3; word >= 0; --word) {
+template <int Words>
+inline int occ_highest(const std::uint64_t (&occ)[Words]) {
+    for (int word = Words - 1; word >= 0; --word) {
         if (occ[word] != 0) {
             return (word << 6) + 63 - __builtin_clzll(occ[word]);
         }
@@ -51,8 +62,10 @@ inline int occ_highest(const std::uint64_t occ[4]) {
 }
 
 /// Smallest set bit strictly greater than `bit`, or -1.
-inline int occ_above(const std::uint64_t occ[4], int bit) {
-    if (bit >= 255) {
+template <int Words>
+inline int occ_above(const std::uint64_t (&occ)[Words], int bit) {
+    const int last = Words * 64 - 1;
+    if (bit >= last) {
         return -1;
     }
     const int start = bit + 1;
@@ -62,7 +75,7 @@ inline int occ_above(const std::uint64_t occ[4], int bit) {
     if (shifted != 0) {
         return (word << 6) + offset + __builtin_ctzll(shifted);
     }
-    for (int next = word + 1; next < 4; ++next) {
+    for (int next = word + 1; next < Words; ++next) {
         if (occ[next] != 0) {
             return (next << 6) + __builtin_ctzll(occ[next]);
         }
@@ -71,14 +84,16 @@ inline int occ_above(const std::uint64_t occ[4], int bit) {
 }
 
 /// Largest set bit strictly less than `bit`, or -1.
-inline int occ_below(const std::uint64_t occ[4], int bit) {
+template <int Words>
+inline int occ_below(const std::uint64_t (&occ)[Words], int bit) {
     if (bit <= 0) {
         return -1;
     }
     const int start = bit - 1;
     const int word = start >> 6;
     const int offset = start & 63;
-    const std::uint64_t mask = (offset == 63) ? ~std::uint64_t{0} : ((std::uint64_t{1} << (offset + 1)) - 1);
+    const std::uint64_t mask =
+        (offset == 63) ? ~std::uint64_t{0} : ((std::uint64_t{1} << (offset + 1)) - 1);
     const std::uint64_t kept = occ[word] & mask;
     if (kept != 0) {
         return (word << 6) + 63 - __builtin_clzll(kept);
@@ -115,11 +130,22 @@ inline PageStats operator+(PageStats lhs, const PageStats& rhs) {
     return lhs;
 }
 
-/// Eight-bit radix over the 56-bit page key (seven steps) plus a 256-tick leaf.
-/// Internal nodes are full 256-wide pointer tables with an occupancy bitmap.
-/// Empty leaves and the directory nodes that become empty are recycled onto a free list.
+/// Eight-bit radix over the high (64 - PageBits) of the encoded tick, plus a
+/// 2^PageBits-tick leaf. Internal nodes are full 256-wide pointer tables with
+/// an occupancy bitmap. Empty leaves and directory nodes are recycled.
+template <int PageBits = kDefaultPageBits>
 class PagedPriceIndex {
 public:
+    static_assert(PageBits >= 5 && PageBits <= 12, "page width must fit a compact occupancy word set");
+
+    static constexpr int kPageBits = PageBits;
+    static constexpr int kTicks = 1 << PageBits;
+    static constexpr int kOccWords = (kTicks + 63) / 64;
+    static constexpr int kKeyBits = 64 - PageBits;
+    static constexpr int kDigitBits = 8;
+    static constexpr int kDigits = (kKeyBits + kDigitBits - 1) / kDigitBits;
+    static constexpr int kLastDirDepth = kDigits - 1;
+
     struct DirNode {
         std::uint64_t occ[4]{};
         void* child[256]{};
@@ -129,17 +155,14 @@ public:
         std::uint8_t depth{0};
     };
 
-    /// Bitmap plus 256 32-bit level handles. 1056 bytes before the back-pointers.
+    /// Bitmap plus 2^PageBits 32-bit level handles.
     struct Leaf {
-        std::uint64_t occ[4]{};
-        std::uint32_t handle[256]{};
+        std::uint64_t occ[kOccWords]{};
+        std::uint32_t handle[kTicks]{};
         DirNode* parent{nullptr};
         Leaf* free_next{nullptr};
         std::uint8_t parent_digit{0};
     };
-
-    static_assert(sizeof(std::uint64_t[4]) + sizeof(std::uint32_t[256]) == 1056,
-                  "leaf payload is the proposal's ~1.03 KiB");
 
     PagedPriceIndex(LevelPool& pool, Side side) : pool_(&pool), side_(side) {
         root_ = create_node(0);
@@ -149,11 +172,11 @@ public:
     PagedPriceIndex& operator=(const PagedPriceIndex&) = delete;
 
     [[nodiscard]] BookLevel* find(Price price) const {
-        const Leaf* leaf = find_leaf(tick_page_key(price));
+        const Leaf* leaf = find_leaf(tick_page_key<PageBits>(price));
         if (leaf == nullptr) {
             return nullptr;
         }
-        const int slot = tick_page_slot(price);
+        const int slot = tick_page_slot<PageBits>(price);
         if (!occ_test(leaf->occ, slot)) {
             return nullptr;
         }
@@ -165,8 +188,8 @@ public:
         if (level == nullptr) {
             return nullptr;
         }
-        Leaf* leaf = ensure_leaf(tick_page_key(price));
-        const int slot = tick_page_slot(price);
+        Leaf* leaf = ensure_leaf(tick_page_key<PageBits>(price));
+        const int slot = tick_page_slot<PageBits>(price);
         assert(!occ_test(leaf->occ, slot));
         occ_set(leaf->occ, slot);
         leaf->handle[slot] = pool_->handle_of(level);
@@ -180,9 +203,9 @@ public:
     void close(BookLevel* level) {
         assert(level->head == nullptr && level->tail == nullptr);
         const bool was_best = best_ == level;
-        Leaf* leaf = find_leaf(tick_page_key(level->price));
+        Leaf* leaf = find_leaf(tick_page_key<PageBits>(level->price));
         assert(leaf != nullptr);
-        const int slot = tick_page_slot(level->price);
+        const int slot = tick_page_slot<PageBits>(level->price);
         assert(occ_test(leaf->occ, slot));
         occ_clear(leaf->occ, slot);
         leaf->handle[slot] = 0;
@@ -238,7 +261,7 @@ public:
 
 private:
     static std::uint8_t digit_of(std::uint64_t page_key, int depth) {
-        return static_cast<std::uint8_t>((page_key >> ((6 - depth) * 8)) & 0xFF);
+        return static_cast<std::uint8_t>((page_key >> ((kLastDirDepth - depth) * kDigitBits)) & 0xFF);
     }
 
     [[nodiscard]] bool is_better(Price candidate, Price incumbent) const {
@@ -312,14 +335,14 @@ private:
 
     [[nodiscard]] Leaf* find_leaf(std::uint64_t page_key) const {
         const DirNode* node = root_;
-        for (int depth = 0; depth < 6; ++depth) {
+        for (int depth = 0; depth < kLastDirDepth; ++depth) {
             const std::uint8_t digit = digit_of(page_key, depth);
             if (!occ_test(node->occ, digit)) {
                 return nullptr;
             }
             node = static_cast<const DirNode*>(node->child[digit]);
         }
-        const std::uint8_t last = digit_of(page_key, 6);
+        const std::uint8_t last = digit_of(page_key, kLastDirDepth);
         if (!occ_test(node->occ, last)) {
             return nullptr;
         }
@@ -328,7 +351,7 @@ private:
 
     Leaf* ensure_leaf(std::uint64_t page_key) {
         DirNode* node = root_;
-        for (int depth = 0; depth < 6; ++depth) {
+        for (int depth = 0; depth < kLastDirDepth; ++depth) {
             const std::uint8_t digit = digit_of(page_key, depth);
             if (node->child[digit] == nullptr) {
                 DirNode* child = create_node(static_cast<std::uint8_t>(node->depth + 1));
@@ -339,7 +362,7 @@ private:
             }
             node = static_cast<DirNode*>(node->child[digit]);
         }
-        const std::uint8_t last = digit_of(page_key, 6);
+        const std::uint8_t last = digit_of(page_key, kLastDirDepth);
         if (node->child[last] == nullptr) {
             Leaf* leaf = create_leaf();
             leaf->parent = node;
@@ -367,11 +390,11 @@ private:
     }
 
     [[nodiscard]] Leaf* leftmost_from(DirNode* node, int digit) const {
-        if (node->depth == 6) {
+        if (node->depth == kLastDirDepth) {
             return static_cast<Leaf*>(node->child[digit]);
         }
         DirNode* cursor = static_cast<DirNode*>(node->child[digit]);
-        while (cursor->depth < 6) {
+        while (cursor->depth < kLastDirDepth) {
             const int bit = occ_lowest(cursor->occ);
             cursor = static_cast<DirNode*>(cursor->child[bit]);
         }
@@ -380,11 +403,11 @@ private:
     }
 
     [[nodiscard]] Leaf* rightmost_from(DirNode* node, int digit) const {
-        if (node->depth == 6) {
+        if (node->depth == kLastDirDepth) {
             return static_cast<Leaf*>(node->child[digit]);
         }
         DirNode* cursor = static_cast<DirNode*>(node->child[digit]);
-        while (cursor->depth < 6) {
+        while (cursor->depth < kLastDirDepth) {
             const int bit = occ_highest(cursor->occ);
             cursor = static_cast<DirNode*>(cursor->child[bit]);
         }
@@ -397,7 +420,7 @@ private:
             return nullptr;
         }
         const DirNode* node = root_;
-        while (node->depth < 6) {
+        while (node->depth < kLastDirDepth) {
             const int bit = occ_lowest(node->occ);
             node = static_cast<const DirNode*>(node->child[bit]);
         }
@@ -410,7 +433,7 @@ private:
             return nullptr;
         }
         const DirNode* node = root_;
-        while (node->depth < 6) {
+        while (node->depth < kLastDirDepth) {
             const int bit = occ_highest(node->occ);
             node = static_cast<const DirNode*>(node->child[bit]);
         }
@@ -475,5 +498,10 @@ private:
     std::size_t created_leaves_{0};
     std::size_t live_leaves_{0};
 };
+
+static_assert(sizeof(std::uint64_t[4]) + sizeof(std::uint32_t[256]) == 1056,
+              "256-tick leaf payload is the proposal's ~1.03 KiB");
+static_assert(PagedPriceIndex<8>::kLastDirDepth == 6, "256-tick directory stays seven 8-bit steps");
+static_assert(PagedPriceIndex<8>::kTicks == 256, "default page is 256 ticks");
 
 }  // namespace fastlob

@@ -54,6 +54,10 @@ function(fastlob_apply_warnings target)
   endif()
 endfunction()
 
+add_executable(page_param_sweep bench/page_param_sweep.cpp)
+target_link_libraries(page_param_sweep PRIVATE fastlob)
+fastlob_apply_warnings(page_param_sweep)
+
 # ---- Sanitizer helpers (use -DFASTLOB_SANITIZER=asan|ubsan|tsan) ----
 set(FASTLOB_SANITIZER "" CACHE STRING "asan|ubsan|tsan")
 if(FASTLOB_SANITIZER STREQUAL "asan")
@@ -80,6 +84,7 @@ if(FASTLOB_BUILD_TESTS)
     tests/execution_sim_test.cpp
     tests/replay_test.cpp
     tests/price_index_diff_test.cpp
+    tests/page_param_test.cpp
   )
   target_link_libraries(fastlob_tests PRIVATE fastlob fastlob_alloc_probe GTest::gtest_main)
   fastlob_apply_warnings(fastlob_tests)

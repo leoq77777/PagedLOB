@@ -12,7 +12,7 @@ Synthetic MBO  →  Replay (same-thread)  →  Reference / v1 / PagedLOB  →  S
 
 - **Reference LOB**: `std::map` + `std::list` gold standard
 - **FastOrderBook (v1)**: fixed order pool + intrusive FIFO + hash price index + sorted level list
-- **PagedLOB**: same order path; price directory is 256 ticks per leaf page
+- **PagedLOB**: same order path; price directory is `2^PageBits` ticks per leaf (default `PageBits=8`, 256 ticks)
 - **Execution Simulator**: shadow limits (never enter the public FIFO) + market VWAP; currently wired to v1
 - **SPSC**: not part of MVP
 
@@ -60,7 +60,18 @@ PagedLOB vs v1 on deep-book churn (cancel best, add worse; GCC 13.3 `-O3`, KVM 4
 | 1k-level churn p50 | 1.5 µs | 101 ns |
 | 10k-level churn p50 | 12.8 µs | 80 ns |
 
-Sparse far-apart prices spend more memory on pages (about 7–11 MB at 2048 distant levels). Re-run the scripts on your machine before citing numbers.
+Page width is a compile-time parameter (`PagedStorageBookT<PageBits>`). Default stays 256. `page_param_sweep` on GCC 13.3 `-O3`, KVM Xeon (same machine as the churn table):
+
+| ticks | leaf | churn 10k p50 | dense walk 128 lvl | 1-per-page walk | sparse insert | sparse bytes |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | 160 B | 74 ns | 237 ns | 923 ns | 1085 ns | 9.2 MB |
+| 64 | 288 B | 73 ns | 245 ns | 914 ns | 1089 ns | 9.5 MB |
+| 128 | 552 B | 78 ns | 456 ns | 963 ns | 1141 ns | 10.0 MB |
+| **256** | 1080 B | 76 ns | 537 ns | 962 ns | 1242 ns | 11.1 MB |
+| 512 | 2136 B | 78 ns | 545 ns | 1001 ns | 1479 ns | 13.3 MB |
+| 1024 | 4248 B | 78 ns | 548 ns | 1402 ns | 1898 ns | 17.6 MB |
+
+Churn is flat across widths. Dense `top_n` and sparse inserts prefer 32–64 tick leaves. Existing-level updates stay ~37 ns at every width. Re-run the scripts on your machine before citing numbers.
 
 ## Limitations
 
