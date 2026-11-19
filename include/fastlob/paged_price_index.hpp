@@ -9,6 +9,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -131,15 +132,20 @@ inline PageStats operator+(PageStats lhs, const PageStats& rhs) {
 }
 
 /// Eight-bit radix over the high (64 - PageBits) of the encoded tick, plus a
-/// 2^PageBits-tick leaf. Internal nodes are full 256-wide pointer tables with
-/// an occupancy bitmap. Empty leaves and directory nodes are recycled.
-template <int PageBits = kDefaultPageBits>
+/// 2^PageBits-tick leaf. The nearest HotTicks ticks from best live in a dense
+/// array (hot); everything worse stays in the radix (cold). Each level is in
+/// exactly one of the two. Empty leaves and directory nodes are recycled.
+template <int PageBits = kDefaultPageBits, int HotTicks = 256>
 class PagedPriceIndex {
 public:
     static_assert(PageBits >= 5 && PageBits <= 12, "page width must fit a compact occupancy word set");
+    static_assert(HotTicks >= 64 && HotTicks <= 1024 && (HotTicks & (HotTicks - 1)) == 0,
+                  "hot window is a power-of-two ring");
 
     static constexpr int kPageBits = PageBits;
     static constexpr int kTicks = 1 << PageBits;
+    static constexpr int kHotTicks = HotTicks;
+    static constexpr int kHotMask = HotTicks - 1;
     static constexpr int kOccWords = (kTicks + 63) / 64;
     static constexpr int kKeyBits = 64 - PageBits;
     static constexpr int kDigitBits = 8;
@@ -172,15 +178,12 @@ public:
     PagedPriceIndex& operator=(const PagedPriceIndex&) = delete;
 
     [[nodiscard]] BookLevel* find(Price price) const {
-        const Leaf* leaf = find_leaf(tick_page_key<PageBits>(price));
-        if (leaf == nullptr) {
-            return nullptr;
+        const int off = hot_offset(price);
+        if (off >= 0) {
+            const std::uint32_t handle = hot_handle_[hot_index(off)];
+            return handle == 0 ? nullptr : pool_->get(handle);
         }
-        const int slot = tick_page_slot<PageBits>(price);
-        if (!occ_test(leaf->occ, slot)) {
-            return nullptr;
-        }
-        return pool_->get(leaf->handle[slot]);
+        return radix_find(price);
     }
 
     [[nodiscard]] BookLevel* open(Price price) {
@@ -188,13 +191,24 @@ public:
         if (level == nullptr) {
             return nullptr;
         }
-        Leaf* leaf = ensure_leaf(tick_page_key<PageBits>(price));
-        const int slot = tick_page_slot<PageBits>(price);
-        assert(!occ_test(leaf->occ, slot));
-        occ_set(leaf->occ, slot);
-        leaf->handle[slot] = pool_->handle_of(level);
-        if (best_ == nullptr || is_better(price, best_->price)) {
+        const std::uint32_t handle = pool_->handle_of(level);
+        if (best_ == nullptr) {
+            clear_hot();
+            hot_origin_ = price;
+            hot_handle_[hot_index(0)] = handle;
             best_ = level;
+        } else if (is_better(price, best_->price)) {
+            rebase(price);
+            hot_handle_[hot_index(0)] = handle;
+            best_ = level;
+        } else {
+            const int off = hot_offset(price);
+            if (off >= 0) {
+                assert(hot_handle_[hot_index(off)] == 0);
+                hot_handle_[hot_index(off)] = handle;
+            } else {
+                radix_put(level);
+            }
         }
         ++active_;
         return level;
@@ -203,25 +217,38 @@ public:
     void close(BookLevel* level) {
         assert(level->head == nullptr && level->tail == nullptr);
         const bool was_best = best_ == level;
-        Leaf* leaf = find_leaf(tick_page_key<PageBits>(level->price));
-        assert(leaf != nullptr);
-        const int slot = tick_page_slot<PageBits>(level->price);
-        assert(occ_test(leaf->occ, slot));
-        occ_clear(leaf->occ, slot);
-        leaf->handle[slot] = 0;
-        if (!occ_any(leaf->occ)) {
-            release_leaf(leaf);
+        const int off = hot_offset(level->price);
+        if (off >= 0) {
+            const int idx = hot_index(off);
+            assert(hot_handle_[idx] == pool_->handle_of(level));
+            hot_handle_[idx] = 0;
+        } else {
+            radix_remove(level);
         }
         pool_->release(level);
         assert(active_ > 0);
         --active_;
         if (was_best) {
-            best_ = compute_best();
+            best_ = next_best();
+            if (best_ != nullptr) {
+                rebase(best_->price);
+            } else {
+                clear_hot();
+            }
         }
     }
 
     [[nodiscard]] std::size_t copy_top(std::span<LevelView> out) const {
         std::size_t n = 0;
+        for (int off = 0; off < kHotTicks && n < out.size(); ++off) {
+            const std::uint32_t handle = hot_handle_[hot_index(off)];
+            if (handle != 0) {
+                out[n++] = view_of(handle);
+            }
+        }
+        if (n >= out.size()) {
+            return n;
+        }
         if (side_ == Side::Sell) {
             for (Leaf* leaf = leftmost(); leaf != nullptr && n < out.size(); leaf = successor(leaf)) {
                 for (int bit = occ_lowest(leaf->occ); bit >= 0 && n < out.size();
@@ -253,7 +280,7 @@ public:
         s.committed_leaves = created_leaves_;
         s.live_leaves = live_leaves_;
         s.committed_bytes = committed_bytes();
-        s.live_bytes = live_nodes_ * sizeof(DirNode) + live_leaves_ * sizeof(Leaf);
+        s.live_bytes = live_nodes_ * sizeof(DirNode) + live_leaves_ * sizeof(Leaf) + hot_bytes();
         return s;
     }
 
@@ -275,8 +302,216 @@ private:
         return LevelView{level->price, static_cast<Qty>(level->total_qty)};
     }
 
+    [[nodiscard]] static std::size_t hot_bytes() {
+        return sizeof(std::uint32_t) * static_cast<std::size_t>(kHotTicks);
+    }
+
+    [[nodiscard]] int hot_index(int offset) const { return (hot_base_ + offset) & kHotMask; }
+
     [[nodiscard]] std::size_t committed_bytes() const {
-        return created_nodes_ * sizeof(DirNode) + created_leaves_ * sizeof(Leaf);
+        return created_nodes_ * sizeof(DirNode) + created_leaves_ * sizeof(Leaf) + hot_bytes();
+    }
+
+    [[nodiscard]] int hot_offset(Price price) const {
+        if (best_ == nullptr) {
+            return -1;
+        }
+        return offset_from(hot_origin_, price);
+    }
+
+    [[nodiscard]] int offset_from(Price origin, Price price) const {
+        if (side_ == Side::Sell) {
+            if (price < origin) {
+                return -1;
+            }
+            const std::uint64_t delta = static_cast<std::uint64_t>(price) - static_cast<std::uint64_t>(origin);
+            if (delta >= static_cast<std::uint64_t>(kHotTicks)) {
+                return -1;
+            }
+            return static_cast<int>(delta);
+        }
+        if (price > origin) {
+            return -1;
+        }
+        const std::uint64_t delta = static_cast<std::uint64_t>(origin) - static_cast<std::uint64_t>(price);
+        if (delta >= static_cast<std::uint64_t>(kHotTicks)) {
+            return -1;
+        }
+        return static_cast<int>(delta);
+    }
+
+    [[nodiscard]] std::optional<Price> price_at(Price origin, int offset) const {
+        if (side_ == Side::Sell) {
+            if (offset > 0 && origin > std::numeric_limits<Price>::max() - offset) {
+                return std::nullopt;
+            }
+            return origin + offset;
+        }
+        if (offset > 0 && origin < std::numeric_limits<Price>::min() + offset) {
+            return std::nullopt;
+        }
+        return origin - offset;
+    }
+
+    [[nodiscard]] int worse_delta(Price from, Price to) const {
+        if (side_ == Side::Sell) {
+            if (to >= from) {
+                const std::uint64_t delta = static_cast<std::uint64_t>(to) - static_cast<std::uint64_t>(from);
+                return delta >= static_cast<std::uint64_t>(kHotTicks) ? kHotTicks : static_cast<int>(delta);
+            }
+            const std::uint64_t delta = static_cast<std::uint64_t>(from) - static_cast<std::uint64_t>(to);
+            return delta >= static_cast<std::uint64_t>(kHotTicks) ? -kHotTicks : -static_cast<int>(delta);
+        }
+        if (from >= to) {
+            const std::uint64_t delta = static_cast<std::uint64_t>(from) - static_cast<std::uint64_t>(to);
+            return delta >= static_cast<std::uint64_t>(kHotTicks) ? kHotTicks : static_cast<int>(delta);
+        }
+        const std::uint64_t delta = static_cast<std::uint64_t>(to) - static_cast<std::uint64_t>(from);
+        return delta >= static_cast<std::uint64_t>(kHotTicks) ? -kHotTicks : -static_cast<int>(delta);
+    }
+
+    void clear_hot() {
+        std::memset(hot_handle_, 0, sizeof(hot_handle_));
+        hot_base_ = 0;
+    }
+
+    void migrate_hot_to_radix(int offset) {
+        const int idx = hot_index(offset);
+        const std::uint32_t handle = hot_handle_[idx];
+        if (handle == 0) {
+            return;
+        }
+        hot_handle_[idx] = 0;
+        radix_put(pool_->get(handle));
+    }
+
+    void pull_radix_into_hot(int offset) {
+        const auto price = price_at(hot_origin_, offset);
+        if (!price.has_value()) {
+            return;
+        }
+        BookLevel* level = radix_find(*price);
+        if (level == nullptr) {
+            return;
+        }
+        radix_remove(level);
+        hot_handle_[hot_index(offset)] = pool_->handle_of(level);
+    }
+
+    void place_existing(BookLevel* level) {
+        const int off = offset_from(hot_origin_, level->price);
+        if (off >= 0) {
+            const int idx = hot_index(off);
+            assert(hot_handle_[idx] == 0);
+            hot_handle_[idx] = pool_->handle_of(level);
+            return;
+        }
+        radix_put(level);
+    }
+
+    void steal_cold_into_hot() {
+        for (;;) {
+            BookLevel* level = compute_best_cold();
+            if (level == nullptr) {
+                return;
+            }
+            const int off = offset_from(hot_origin_, level->price);
+            if (off < 0 || off >= kHotTicks) {
+                return;
+            }
+            radix_remove(level);
+            hot_handle_[hot_index(off)] = pool_->handle_of(level);
+        }
+    }
+
+    void shift_hot(int delta, Price new_origin) {
+        if (delta > 0) {
+            for (int i = 0; i < delta; ++i) {
+                migrate_hot_to_radix(i);
+            }
+            hot_base_ = (hot_base_ + delta) & kHotMask;
+            hot_origin_ = new_origin;
+            for (int i = kHotTicks - delta; i < kHotTicks; ++i) {
+                pull_radix_into_hot(i);
+            }
+            return;
+        }
+        const int d = -delta;
+        for (int i = kHotTicks - d; i < kHotTicks; ++i) {
+            migrate_hot_to_radix(i);
+        }
+        hot_base_ = (hot_base_ - d) & kHotMask;
+        hot_origin_ = new_origin;
+        for (int i = 0; i < d; ++i) {
+            pull_radix_into_hot(i);
+        }
+    }
+
+    void rebuild_hot(Price new_origin) {
+        std::uint32_t saved[kHotTicks];
+        std::memcpy(saved, hot_handle_, sizeof(saved));
+        clear_hot();
+        hot_origin_ = new_origin;
+        for (int i = 0; i < kHotTicks; ++i) {
+            if (saved[i] != 0) {
+                place_existing(pool_->get(saved[i]));
+            }
+        }
+        steal_cold_into_hot();
+    }
+
+    void rebase(Price new_origin) {
+        if (best_ != nullptr && new_origin == hot_origin_) {
+            return;
+        }
+        const int delta = worse_delta(hot_origin_, new_origin);
+        if (best_ != nullptr && delta != 0 && delta > -kHotTicks && delta < kHotTicks) {
+            shift_hot(delta, new_origin);
+            return;
+        }
+        rebuild_hot(new_origin);
+    }
+
+    [[nodiscard]] BookLevel* next_best() const {
+        for (int off = 0; off < kHotTicks; ++off) {
+            const std::uint32_t handle = hot_handle_[hot_index(off)];
+            if (handle != 0) {
+                return pool_->get(handle);
+            }
+        }
+        return compute_best_cold();
+    }
+
+    [[nodiscard]] BookLevel* radix_find(Price price) const {
+        const Leaf* leaf = find_leaf(tick_page_key<PageBits>(price));
+        if (leaf == nullptr) {
+            return nullptr;
+        }
+        const int slot = tick_page_slot<PageBits>(price);
+        if (!occ_test(leaf->occ, slot)) {
+            return nullptr;
+        }
+        return pool_->get(leaf->handle[slot]);
+    }
+
+    void radix_put(BookLevel* level) {
+        Leaf* leaf = ensure_leaf(tick_page_key<PageBits>(level->price));
+        const int slot = tick_page_slot<PageBits>(level->price);
+        assert(!occ_test(leaf->occ, slot));
+        occ_set(leaf->occ, slot);
+        leaf->handle[slot] = pool_->handle_of(level);
+    }
+
+    void radix_remove(BookLevel* level) {
+        Leaf* leaf = find_leaf(tick_page_key<PageBits>(level->price));
+        assert(leaf != nullptr);
+        const int slot = tick_page_slot<PageBits>(level->price);
+        assert(occ_test(leaf->occ, slot));
+        occ_clear(leaf->occ, slot);
+        leaf->handle[slot] = 0;
+        if (!occ_any(leaf->occ)) {
+            release_leaf(leaf);
+        }
     }
 
     DirNode* create_node(std::uint8_t depth) {
@@ -470,7 +705,7 @@ private:
         return nullptr;
     }
 
-    [[nodiscard]] BookLevel* compute_best() const {
+    [[nodiscard]] BookLevel* compute_best_cold() const {
         if (side_ == Side::Sell) {
             Leaf* leaf = leftmost();
             if (leaf == nullptr) {
@@ -493,6 +728,9 @@ private:
     std::vector<std::unique_ptr<DirNode>> nodes_;
     std::vector<std::unique_ptr<Leaf>> leaves_;
     BookLevel* best_{nullptr};
+    Price hot_origin_{0};
+    int hot_base_{0};
+    std::uint32_t hot_handle_[kHotTicks]{};
     std::size_t active_{0};
     std::size_t created_nodes_{0};
     std::size_t live_nodes_{0};

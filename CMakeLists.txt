@@ -86,6 +86,7 @@ if(FASTLOB_BUILD_TESTS)
     tests/price_index_diff_test.cpp
     tests/page_param_test.cpp
     tests/match_test.cpp
+    tests/hot_cold_test.cpp
   )
   target_link_libraries(fastlob_tests PRIVATE fastlob fastlob_alloc_probe GTest::gtest_main)
   fastlob_apply_warnings(fastlob_tests)
