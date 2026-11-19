@@ -200,4 +200,4 @@ if(FASTLOB_BUILD_PYTHON)
   fastlob_apply_warnings(pyfastlob)
 endif()
 
-message(STATUS "FastLOB: tests=${FASTLOB_BUILD_TESTS} bench=${FASTLOB_BUILD_BENCH} python=${FASTLOB_BUILD_PYTHON} sanitizer=${FASTLOB_SANITIZER}")
+message(STATUS "PagedLOB: tests=${FASTLOB_BUILD_TESTS} bench=${FASTLOB_BUILD_BENCH} python=${FASTLOB_BUILD_PYTHON} sanitizer=${FASTLOB_SANITIZER}")

@@ -11,7 +11,10 @@
 #include <random>
 #include <set>
 #include <tuple>
+#include <type_traits>
 #include <vector>
+
+static_assert(std::is_same_v<fastlob::PagedLOB, fastlob::PagedStorageBook>);
 
 using fastlob::BookEvent;
 using fastlob::EventType;

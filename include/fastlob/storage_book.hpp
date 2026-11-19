@@ -238,5 +238,7 @@ private:
 
 using MapStorageBook = StorageBook<MapPriceIndex>;
 using PagedStorageBook = StorageBook<PagedPriceIndex>;
+/// Public name of the paged engine. Same type as PagedStorageBook.
+using PagedLOB = PagedStorageBook;
 
 }  // namespace fastlob
