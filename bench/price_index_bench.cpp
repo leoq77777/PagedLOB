@@ -5,6 +5,7 @@
 #include "fastlob/lob_fast.hpp"
 #include "fastlob/price_key.hpp"
 #include "fastlob/storage_book.hpp"
+#include "perf_counters.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -98,6 +99,8 @@ struct Row {
     double p50_sd{0};
     std::uint64_t price_bytes{0};
     std::uint64_t total_bytes{0};
+    std::uint64_t single_rep_ops{0};
+    fastlob::bench::PerfSnapshot perf{};
 };
 
 std::vector<Row> g_rows;
@@ -154,6 +157,20 @@ void measure(const char* workload, const char* book_name, const char* unit, int 
     row.p50_sd = stdev(rep_means);
     row.price_bytes = memory.price_bytes;
     row.total_bytes = memory.total_bytes();
+    row.single_rep_ops = static_cast<std::uint64_t>(batches * ops_per_batch);
+
+    fastlob::bench::LinuxPerfCounters perf;
+    if (perf.available()) {
+        Book book(cap_orders, cap_levels);
+        if (setup(book)) {
+            perf.reset_and_enable();
+            for (int i = 0; i < batches; ++i) {
+                batch(book);
+            }
+            perf.disable();
+            row.perf = perf.read();
+        }
+    }
     g_rows.push_back(row);
 }
 
@@ -327,6 +344,22 @@ void print_table() {
                   << row.p50_sd << " | " << row.price_bytes << " | " << row.total_bytes << " |\n";
     }
     std::cout << "END_MD\n";
+    if (!g_rows.empty() && g_rows[0].perf.available) {
+        std::cout << "BEGIN_PERF_MD\n";
+        std::cout << "| workload | book | cycles/op | inst/op | IPC | br_miss/1k | L1d_miss/1k | LLC_miss/1k |\n";
+        std::cout << "|---|---|---:|---:|---:|---:|---:|---:|\n";
+        for (const Row& row : g_rows) {
+            const double n = static_cast<double>(row.single_rep_ops);
+            std::cout << "| " << row.workload << " | " << row.book << " | "
+                      << std::setprecision(1) << (static_cast<double>(row.perf.cycles) / n) << " | "
+                      << (static_cast<double>(row.perf.instructions) / n) << " | "
+                      << std::setprecision(2) << row.perf.ipc() << " | "
+                      << (1000.0 * static_cast<double>(row.perf.branch_misses) / n) << " | "
+                      << (1000.0 * static_cast<double>(row.perf.l1d_load_misses) / n) << " | "
+                      << (1000.0 * static_cast<double>(row.perf.llc_load_misses) / n) << " |\n";
+        }
+        std::cout << "END_PERF_MD\n";
+    }
     std::cout << "dir_node_bytes " << fastlob::PagedPriceIndex<8>::dir_node_bytes() << "\n";
     std::cout << "leaf_bytes " << fastlob::PagedPriceIndex<8>::leaf_bytes() << "\n";
     std::cout << "sink " << g_sink << "\n";

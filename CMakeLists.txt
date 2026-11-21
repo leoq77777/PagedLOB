@@ -40,6 +40,12 @@ endif()
 add_library(fastlob INTERFACE)
 target_include_directories(fastlob INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
+find_package(ZLIB QUIET)
+if(ZLIB_FOUND)
+  target_link_libraries(fastlob INTERFACE ZLIB::ZLIB)
+  target_compile_definitions(fastlob INTERFACE FASTLOB_HAS_ZLIB=1)
+endif()
+
 add_library(fastlob_alloc_probe STATIC src/alloc_probe.cpp)
 target_include_directories(fastlob_alloc_probe PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 if(FASTLOB_ENABLE_ALLOC_PROBE)
@@ -90,6 +96,7 @@ if(FASTLOB_BUILD_TESTS)
     tests/page_param_test.cpp
     tests/match_test.cpp
     tests/hot_cold_test.cpp
+    tests/itch50_test.cpp
   )
   target_link_libraries(fastlob_tests PRIVATE fastlob fastlob_alloc_probe GTest::gtest_main)
   fastlob_apply_warnings(fastlob_tests)
@@ -110,6 +117,10 @@ if(FASTLOB_BUILD_BENCH)
   add_executable(price_index_bench bench/price_index_bench.cpp)
   target_link_libraries(price_index_bench PRIVATE fastlob)
   fastlob_apply_warnings(price_index_bench)
+
+  add_executable(itch_replay_bench bench/itch_replay_bench.cpp)
+  target_link_libraries(itch_replay_bench PRIVATE fastlob)
+  fastlob_apply_warnings(itch_replay_bench)
 
   # Bench-only third-party books. The core fastlob target does not see them.
   FetchContent_Declare(
