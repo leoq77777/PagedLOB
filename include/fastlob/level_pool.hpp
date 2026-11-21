@@ -113,6 +113,7 @@ public:
 
     [[nodiscard]] std::size_t bytes() const { return storage_.size() * sizeof(BookLevel); }
     [[nodiscard]] std::size_t live() const { return live_; }
+    [[nodiscard]] bool has_free() const { return free_head_ != 0; }
     [[nodiscard]] std::size_t capacity() const { return storage_.empty() ? 0 : storage_.size() - 1; }
 
 private:
