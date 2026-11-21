@@ -1,4 +1,4 @@
-# PagedLOB (`zqr-core`)
+# PagedLOB
 
 **PagedLOB is a C++20 high-update-rate in-memory L3 order book.** The nearest 256 ticks from `best_` sit in a dense hot handle ring; worse prices live on `2^PageBits`-tick cold leaves (default `PageBits=8`, 256 ticks) under an 8-bit radix directory with occupancy bitmaps (`ctz`/`clz`). Orders use a fixed pool, an intrusive FIFO, an open-addressed `OrderIdIndex`, and a 32-bit `Order.level_handle` so cancel/modify/execute/match skip price lookup.
 
