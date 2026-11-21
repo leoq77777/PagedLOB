@@ -1,8 +1,8 @@
-# PagedLOB 架构说明
+# PagedLOB 架构说明与版本演进
 
-本文描述 **当前栈顶** 的 `fastlob::PagedLOB`（commit `b9430b7`，含 256-tick **hot window**）。对象是一份可放进简历包的设计说明，不是 API 手册。
+本文描述 **v0.3.0** 的 `fastlob::PagedLOB`（含 256-tick **hot window + 物理位图**、**冷区有序双向叶链** 与 **单数组单次探测 `OrderIdIndex`**）。定位是一份自包含的架构设计、基准评测与版本演进文档。
 
-对照数字全部来自 2026-11-19（America/New_York）在本仓库 Release 二进制上重跑的结果，见 [§4](#4-benchmark)。正文只讨论 PagedLOB；其它 book 只出现在基准表里。
+对照数字全部来自 **2026-11-21（America/New_York, EST）** 在本仓库 Release 二进制上重跑的结果，见 [§4](#4-benchmark)；历史每次版本改动及指标变化见 [§8 版本演进日志（Changelog）](#8-版本演进日志changelog)。
 
 ---
 
@@ -10,120 +10,129 @@
 
 ### 1.1 解决什么问题
 
-PagedLOB 是内存里的 **L3** 限价簿：每个 `Order` 保留身份、数量、价格、队列位置。价位目录覆盖整个 `int64` tick 空间，但近盘口的更新和扫描必须走短路径。
+PagedLOB 是内存里的 **L3** 限价订单簿：每个 `Order` 保留身份、数量、价格与队列位置。价位目录覆盖完整有符号 `int64` tick 空间，同时保证近盘口的增删改查、深度快照与主动单撮合全部走常数级短路径。
 
-两条互不混淆的入口：
+引擎提供两条语义严格分离的入口：
 
 | 入口 | 用途 | 是否撮合 |
 |---|---|---|
-| `apply(BookEvent)` → `add` / `cancel` / `modify` / `execute` | 合成 **MBO** 回放。Feed 已经给出成交，簿只复现状态。 | 否 |
-| `match_limit` / `match_market` | 主动单：吃对侧 `best_` 的 FIFO，限价剩余挂上，市价剩余不挂。 | 是 |
+| `apply(BookEvent)` → `add` / `cancel` / `modify` / `execute` | **MBO** 行情回放。交易所 Feed 已给出成交，订单簿只忠实复现状态。 | 否 |
+| `match_limit` / `match_market` | 主动单撮合：按价格-时间优先（FIFO）吃对侧 `best_`，限价剩余挂单，市价剩余不挂。 | 是 |
 
-`execute` 是「按 id 扣一张休息单」，给 MBO 的 trade 事件用，不是撮合循环。
+`execute` 表示「按订单 ID 扣减一张挂单」（对应 MBO trade 事件），而非主动撮合循环。
 
 ### 1.2 设计目标
 
-1. **构造后热路径零堆分配**：`Order`、`BookLevel`、radix 节点都从池或 free-list 取。
-2. **已有档上的 cancel / execute 不再查价**：`Order.level_handle` 直接拿到 `BookLevel*`。
-3. **近盘口 `find` / `top_n` 不走七层 radix**：best 起 256 tick 放在 handle 环上。
-4. **稀疏、远离盘口的价仍要有序、可回收**：冷区是 occupancy bitmap 的页叶 + 8-bit radix。
-5. **正确性可差分**：同一串 `apply` 事件与 `std::map` 金标准和 typed 撮合测试对齐。
+1. **构造后热路径零堆分配**：`Order`、`BookLevel` 从固定池取；冷区 radix `DirNode` / `Leaf` 支持 `reserve_cold` 预留并在内部 free-list 循环复用（由 `ZeroAlloc.PagedLobHotAndReservedColdPaths` 验证）。
+2. **已有档上的 cancel / modify / execute / 成交扣单不再查价**：`Order.level_handle` 以 32-bit 池句柄 O(1) 定位 `BookLevel*`。
+3. **近盘口 `find` / `top_n` / `match_touch` 不走七层 radix，也不扫空槽**：`best_` 起 256 tick 放在带物理占用位图 `hot_occ_[4]` 的 handle 环上。
+4. **远端冷区既可稀疏寻址，又可顺序横扫**：冷区使用 8-bit radix 定位页叶，同时将所有非空 `Leaf` 串成按 `page_key` 升序的侵入式双向链表，使跨页 `top_n` 与盘口推进时的冷热晋升均无需回爬目录树。
+5. **正确性与边界完备**：使用可移植 C++20 `<bit>` 位运算、64-bit `LevelQty` 防聚合溢出、满池/满表 `NDEBUG` 防护，并通过 `std::map` 参考簿、`Liquibook`、`Tzadiko`、`br-avl` 差分测试（含交叉撮合）以及 `ASan + UBSan` CI。
 
-### 1.3 取舍
+### 1.3 核心取舍
 
-- **单线程**。没有锁、没有 seqlock。并发是调用方的事。
-- **容量预留**。`OrderPool` / `LevelPool` / `OrderIdIndex` 在构造时按 `max_orders`、`max_levels` 一次分配。撮合 bench 里 `heap_bytes` 很大，是池子，不是 live 订单。
-- **页宽默认 256 tick**（`PageBits=8`）。更窄的叶对跨页扫描略好，对 exist/churn 几乎无差；见 [§4.4](#44-页宽-pagebitssweep)。
-- **hot window 是互斥分层，不是 cache**。窗口内的档不进 radix；空槽就表示这个 tick 没有档。因此 `find` 在窗口内是数组下标，但 best 移动时必须把越过边界的档搬进/搬出 radix。
-- **没有 STP、没有隐藏单、没有价格修改**（改价 = cancel+add）。`modify` 只允许数量下调并保留 FIFO 位置。
-- **Python / Execution Simulator 还没接到 PagedLOB 上。**
+- **单线程、单标的**。热路径无锁、无原子指令；跨线程分发由外部 sequencer 负责。
+- **容量预分配**。`OrderPool`、`LevelPool`、`OrderIdIndex` 在构造时按 `max_orders`、`max_levels` 一次性分配。基准测试中 `match_*` 的 `heap_bytes` 来自 `1<<18` 容量池，而非活跃订单泄漏。
+- **页宽默认 256 tick**（`PageBits=8`）。更窄的页（如 64 tick）在极稀疏跨页扫描上更省带宽，256 tick 在近盘口密度与冷区层高（7 层 vs 8 层）之间最均衡，见 [§4.4](#44-页宽-pagebitssweep)。
+- **hot window 是互斥分层，不是缓存**。每个活跃 `BookLevel` 只存在于热环 **或** 冷区 radix 之一；热环空槽即代表该 tick 无挂单，miss 无需回查 radix。代价是 `best_` 移动时需要在窗口边界做增量迁出/迁入。
+- **无自成交预防（STP）、无冰山单、无原地改价**（改价 = `cancel` + `add`）。`modify` 仅支持减量并保持原 FIFO 队序。
 
 ---
 
 ## 2. 数据结构与内存布局
 
-公开类型：`using PagedLOB = StorageBook<PagedPriceIndex<8>>;`（第二模板参数默认 `HotTicks=256`）。
+公开别名：`using PagedLOB = StorageBook<PagedPriceIndex<8, 256>>;`（也可通过 `PagedStorageBookT<PageBits, HotTicks>` 定制编译期页宽与热窗口宽度）。
 
-本机 `g++-13 -O3` 测到的 `sizeof`：
+本机 `g++-13 -O3` 实测结构大小：
 
-| 对象 | 字节 |
-|---|---:|
-| `Order` | 56（上限 64，不 `alignas(64)`，优先密度） |
-| `BookLevel` | 40 |
-| `DirNode` | 2104 |
-| `Leaf`（256 tick） | 1080 |
+| 对象 | 字节 | 布局说明 |
+|---|---:|---|
+| `Order` | 56 | 含侵入式 `prev`/`next` 与 32-bit `level_handle`，紧凑排布以提高缓存密度 |
+| `OrderIdIndex::Entry` | 16 | `{OrderId key, Order* val}` 单数组相邻存放，每条 64B 缓存行容纳 4 个槽位 |
+| `BookLevel` | 40 | `Order* head/tail`、64-bit `total_qty`、`order_count`、`price`、`side` |
+| `DirNode` | 2104 | `occ[4]`（32B）+ `child[256]`（2048B）+ 父指针与 free-list 元数据 |
+| `Leaf`（256 tick） | 1104 | **首条 64B 缓存行打包 `occ[4]` + `page_key` + `prev_leaf` + `next_leaf` + `parent`**，随后紧跟 `handle[256]`（1024B） |
+| 热环状态（每侧） | 1056 | `hot_handle_[256]`（1024B）+ `hot_occ_[4]`（32B） |
 
-### 2.1 价位键
+### 2.1 价位键编码
 
-`Price` 是 `int64` tick。`encode_tick` 翻转符号位，使无符号顺序与价格顺序一致，于是 radix 和页槽对负价、`INT64_MIN` 都成立。
+`Price` 为有符号 `int64` tick。`encode_tick` 通过异或 `0x8000'0000'0000'0000ULL` 翻转符号位，使无符号字典序与有符号价格序严格同构，正负价格、`INT64_MIN`、`INT64_MAX` 均可无分支统一处理。
 
-默认 `PageBits=8`：
+默认 `PageBits=8` 时：
 
-- 页键 = 高 56 bit
-- 页内槽 = 低 8 bit → **256 tick / 叶**
-- 8-bit 一截 → **7 个 digit**，最后一截指向 `Leaf`（`kLastDirDepth = 6`，从 root 走 6 个 `DirNode` 再进叶，共 7 步）
+- **页键（`page_key`）**：高 56 bit
+- **页内槽（`slot`）**：低 8 bit（`0..255`，256 tick / 叶）
+- **Radix 层高**：56 bit 按 8-bit 切分为 **7 段**（`kLastDirDepth = 6`，根向下走 6 层 `DirNode` 到达第 7 层 `Leaf`）
 
-### 2.2 Radix 页目录（冷区）
+### 2.2 冷区：8-bit Radix 页目录 + 有序侵入式双向叶链
 
-`DirNode`：256 个 child 指针 + 4×`uint64` occupancy。空节点回收到 `free_nodes_`，不还给 OS。
+- **`DirNode`**：256 路指针 + `occ[4]` 位图。空节点回收到 `free_nodes_` 链表。
+- **`Leaf`**：首缓存行放置 `occ[4]`、`page_key`、`prev_leaf`、`next_leaf`、`parent`，其后为 `handle[256]`。
+  - **点查 / 插入**：先 O(1) 比对冷区首尾端点 `min_leaf_->page_key` / `max_leaf_->page_key`（覆盖最常见的窗口滑出/滑入与远端追加），未命中再走 7 层 `DirNode`。
+  - **顺序扫描与最优冷档**：`min_leaf_` / `max_leaf_` 使 `compute_best_cold()` 与 `steal_cold_into_hot()` 降为 **O(1)**，跨页 `copy_top` 沿 `next_leaf` / `prev_leaf` 顺序走叶首缓存行，不再反复回爬 `DirNode`。
 
-`Leaf`：`occ[4]`（256 bit）+ `handle[256]`（32-bit `LevelPool` 句柄）。遍历用 `__builtin_ctzll` / `__builtin_clzll` 找下一个占用槽，不扫空 tick。
+### 2.3 `BookLevel`、64-bit `LevelQty` 与池化 FIFO
 
-冷区 **只存放窗口以外的档**。近盘口 256 tick 不占叶。
+`LevelPool` 是索引稳定的连续数组（`handle == 0` 保留为空）。`BookLevel` 维护侵入式 `Order*` 双向队列与 64-bit `total_qty`；对外查询接口 `level_qty()` 与快照元素 `LevelView::qty` 统一使用 64-bit `LevelQty`（`uint64_t`），即使单档累计挂单量超过 `UINT32_MAX` 也不会截断。
 
-### 2.3 `BookLevel` 与池化 FIFO
+`StorageBook::find(OrderId)` 返回值拷贝快照前会清空内部指针字段（`prev = nullptr`、`next = nullptr`、`level_handle = 0`），防止调用方误悬垂解引用内部池节点。
 
-`LevelPool` 是下标稳定的 slab，**handle 0 为空**。`BookLevel` 上是 `Order*` 侵入式双向 FIFO（`head` / `tail`）和 64-bit `total_qty`（档位合计，避免 32-bit 环绕）。
+### 2.4 单数组、单次探测 `OrderIdIndex`
 
-`Order` 上是 `prev` / `next`、数量、以及 `level_handle`。Cancel / execute / 撮合扣单用 handle 取档，**不再 `find(price)`**。
+开放寻址哈希表，容量固定为 `next_pow2(max_orders * 2)`，构造后永不 rehash：
 
-### 2.4 `OrderIdIndex`
+- **单数组键值共置**：`std::vector<Entry> slots_` 将 8B `key` 与 8B `Order*` 放在同一缓存行，消除原先 `keys_[]` / `vals_[]` 双数组带来的二次 L1/L2 缓存缺失。
+- **单乘法混合哈希**：使用 64-bit 乘法混合器 `(x ^ (x >> 30)) * 0xd6e8feb86659fd93ULL` 后再右移异或，缩短关键路径指令延迟。
+- **单次探测原语**：
+  - 新增挂单使用 `find_empty_slot(id, slot)` + `commit_slot(slot, id, order)`（查重与定位插入槽合并为 1 次探测，而非 `find` + `insert` 两次探测）。
+  - 撤单使用 `take(id)`（查找与删除合并为 1 次探测）。
+  - 扣单/减量使用 `find_with_slot(id, slot)` + 归零时 `erase_slot(slot)`。
+- **无墓碑 Knuth Algorithm R 回移**：以模掩码无分支距离比较 `((i - home) & mask_) >= ((i - hole) & mask_)` 修复探测簇，且探测循环带 `step < capacity_` 上界保护，`NDEBUG` 满表时安全返回 `false` 绝不死循环。
 
-开放寻址、容量固定为 `next_pow2(max_orders * 2)`，构造后不 rehash。`erase` 清槽后再 `rehash_from` 把簇补回去（没有 tombstone）。热路径每次 cancel 都要做一次哈希探测，这是 exist 负载里仍然贵的部分之一。
+### 2.5 `best_` 与带物理位图的 256-tick 热环
 
-### 2.5 `best_` 与 hot window
+每侧 `PagedPriceIndex` 维护：
 
-每侧一个 `PagedPriceIndex`，各自持有：
+- `BookLevel* best_`：最优档指针（空侧为 `nullptr`）
+- `Price hot_origin_`：热环原点（非空时恒等于 `best_->price`）
+- `int hot_base_`：环形旋转下标（`0..255`）
+- `uint32_t hot_handle_[256]`：逻辑偏移 `off` 映射到物理槽 `(hot_base_ + off) & 255`
+- `uint64_t hot_occ_[4]` + `size_t hot_count_`：**按物理环槽位编号**的 256-bit 占用位图与活跃计数
 
-- `BookLevel* best_`：当前最优档（买最高 / 卖最低）
-- `Price hot_origin_`：窗口原点，等于 `best_->price`（有档时）
-- `int hot_base_`：环的旋转量
-- `uint32_t hot_handle_[256]`：offset `i` 对应 `hot_handle_[(hot_base_ + i) & 255]`，卖侧价格 `origin+i`，买侧 `origin-i`
+**核心技巧（物理位图免移位）**：因为 `hot_occ_` 按物理下标 `idx` 而非逻辑 `off` 置位，当 `best_` 旋转 `hot_base_` 时，**完全不需要对 256-bit 位图做跨字移位**！按价格序扫描热环只需拆成两段单调物理区间：`[hot_base_, 256)` 与 `[0, hot_base_)`，每段直接用 `w &= (w - 1)` + `std::countr_zero(w)` 逐字紧凑输出。当最后一档被打穿变空簿时（如 `match_touch`），`hot_occ_` 已自然归零，无需任何 1 KiB `memset` 或 256 槽空扫。
 
-best 挪 1 tick：`hot_base_` ±1，近端槽迁出到 radix，远端槽从 radix 偷入。跳跃（`|Δ| ≥ 256`）走 `rebuild_hot`。
-
-### 2.6 结构关系
+### 2.6 结构关系图
 
 ```mermaid
 flowchart TB
   subgraph api [API]
-    apply["apply / add / cancel / execute"]
+    apply["apply / add / cancel / modify / execute"]
     match["match_limit / match_market"]
   end
 
   subgraph book [StorageBook / PagedLOB]
-    ids["OrderIdIndex\nOrderId → Order*"]
+    ids["OrderIdIndex\nsingle Entry[] + 1-probe"]
     pool["OrderPool"]
     levels["LevelPool\nhandle → BookLevel"]
     bids["PagedPriceIndex Buy"]
     asks["PagedPriceIndex Sell"]
   end
 
-  subgraph orderobj [Order]
-    oh["level_handle"]
+  subgraph orderobj [Order 56B]
+    oh["level_handle (u32)"]
     fifo["prev / next"]
   end
 
-  subgraph levelobj [BookLevel]
+  subgraph levelobj [BookLevel 40B]
     hd["head / tail FIFO"]
-    tq["total_qty"]
+    tq["total_qty (u64)"]
   end
 
-  subgraph index [一侧价位目录]
+  subgraph index [单侧 PagedPriceIndex]
     best["best_"]
-    ring["hot ring 256 tick"]
-    radix["radix DirNode x7"]
-    leaf["cold Leaf\nbitmap + handles"]
+    ring["hot ring 256 tick\nhot_handle_[256] + hot_occ_[4]"]
+    radix["cold radix DirNode x6"]
+    leaf["cold Leaf 1104B\nCL0: occ+key+prev/next\nhandle[256]"]
   end
 
   apply --> ids
@@ -136,240 +145,249 @@ flowchart TB
   bids --> index
   asks --> index
   best --> ring
-  ring -->|"miss / 更差的价"| radix
+  ring -->|"offset ≥ 256"| radix
   radix --> leaf
+  leaf <-->|"sorted prev_leaf / next_leaf"| leaf
   leaf --> levels
   ring --> levels
 ```
 
 ---
 
-## 3. 关键路径
+## 3. 关键路径分析
 
-复杂度按「一次调用、档位数 *L*、订单数 *N*、radix 高度 *H*=7、窗口 *W*=256」写。单线程，cache 行为是经验，不是证明。
+设活跃档位数为 *L*、订单数为 *N*、radix 层高 *H*=7、热窗口宽度 *W*=256、单次撮合成交笔数为 *F*。
 
 ### 3.1 `add`
 
-1. 拒绝 `id==0`、`qty==0`、重复 id。
-2. `index.find(price)`：在窗口内 O(1) 下标；否则 O(*H*) 走 radix。
-3. 未命中则 `open`：`LevelPool::acquire`，新 best 则 `rebase`，窗口内写环，否则 `radix_put`。
-4. `OrderPool::allocate`，写字段和 `level_handle`，`fifo_push`（档位 `total_qty += qty`），`OrderIdIndex::insert`。
+1. 校验 `id != 0`、`qty != 0`、`pool_.free_count() > 0`（池满直接无副作用拒绝）。
+2. `ids_.find_empty_slot(id, id_slot)`：1 次开放寻址探测同时完成重复 ID 检查并锁定空槽。
+3. `index.find_or_open(price)`：
+   - 空侧：直接 `acquire` 档位并置 `hot_base_ = 0`、写 `hot_handle_[0]` 与 `hot_occ_`（零 `memset`）。
+   - 更优新 `best_`：`promote_better_origin(price)` 将滑出窗口的槽位迁入冷区（**数学上冷区所有档位均劣于 `old_origin + W`，新 `best_` 变优时不可能有冷档进入热窗口，因此零冷区回查**，迁出开销 `O(min(Δ, hot_count_))`）。
+   - 窗口内命中/新开：O(1) 物理下标读写。
+   - 窗口外冷档：`find_or_open` **单次**走完页查找/建叶与槽位置位（先查 `min_leaf_`/`max_leaf_` 端点快路径，未命中再走 *H* 层）。若 `LevelPool` 已满且该冷价位不存在，则在分配任何叶节点前直接失败返回。
+4. `pool_.allocate()` + `fifo_push` + `ids_.commit_slot(id_slot, id, order)`（零二次哈希探测）。
 
-已有档、价在窗口内：不碰 radix，叶也不动。新档且是更优价：可能旋转或重建整个窗口。订单池空且刚 `open` 成功会 `close` 回滚（有单测）。
+### 3.2 `cancel`
 
-### 3.2 `cancel` / `remove_order`
+1. `Order* order = ids_.take(id)`：单次探测查到 `Order*` 并当场用 Knuth R 回移删除槽位。
+2. `levels_.get(order->level_handle)`：O(1) 取 `BookLevel*`，**完全不查价格索引**。
+3. 扣减 `total_qty`、FIFO 摘链、归还 `OrderPool`。
+4. 若档位归零则 `index.close(level)`：
+   - 非 `best_`：热环内 O(1) 清 `hot_handle_` 与 `hot_occ_` bit；冷区清叶 bit，空叶 O(1) 从双向叶链摘除并沿父链回收空 `DirNode`。
+   - 关掉 `best_`：若 `hot_count_ > 0`，通过 `occ_at_or_above(hot_occ_, hot_base_)` / `occ_lowest(hot_occ_)` **4 条位图指令内 O(1) 找到下一热档**，旋转 `hot_base_`，再用 `steal_cold_into_hot()` 从 `min_leaf_` / `max_leaf_` 头部按需拉入新进窗冷档（每档 O(1)，无需爬树）；若热环已空且冷区也空，直接置 `best_ = nullptr`。
 
-1. `OrderIdIndex::find`（开放寻址）。
-2. `levels_.get(order->level_handle)`，**不查价**。
-3. 减 `total_qty`，FIFO unlink，erase id，还订单槽。
-4. 档空则 `index.close`：窗口内清环槽；冷档 `radix_remove`，叶空则回收目录。
+### 3.3 `modify` 与 `execute`
 
-若关掉的是 `best_`：`next_best` 先扫环（通常 offset 1 就是下一个），再 `rebase`。稠密盘口上 best 挪 1 tick 是 O(1) 旋转 + 一次远端 `radix_find`。
+- `modify`：仅支持减量（`new_qty == 0` 等价于 `cancel`），原地更新 `order->qty` 与 `level->total_qty`，保留队序。
+- `execute`：`find_with_slot` 单次探测拿到挂单并扣减成交量；若该单扣完，直接对已知 `slot` 调 `erase_slot(slot)`，省去二次查找。
 
-### 3.3 `modify`
+### 3.4 `match_limit` 与 `match_market`
 
-只允许 `new_qty ≤ old`。0 等于 cancel。否则只改该单 `qty` 和档位 `total_qty`，**不改变 FIFO 位置**。
+1. 校验参数并通过 `ids_.find_empty_slot(id, id_slot)` 确认 taker ID 未重复（若对侧为空且不交叉则直接走单次探测挂单快路径）。
+2. 若交叉，循环取对侧 `best_` 队首 maker 单，按 maker 价成交 `min(remaining, maker->qty)`，对 maker 执行 `ids_.take(maker->id)`（仅在吃光该单时删除 ID），档空触发 `close`。
+3. 若 `match_limit` 吃穿或部分成交后仍有 `remaining > 0`，检查池余量并调用 `commit_slot` 将剩余挂入本侧（紧容量下吃穿释放的槽位可立即被剩余单复用，见单测 `Match.TightCapacityPartialAndDrainRest`）。`match_market` 剩余量直接写入 `MatchResult::remaining`，不挂单。
 
-### 3.4 `execute`
+### 3.5 `top_n` / `copy_top`
 
-按 id 找到休息单，`apply_fill`。部分成交留在队头；数量归零则 unlink，档空则 `close`。这是 MBO 的成交事件，不是撮合。
-
-### 3.5 `match_limit`
-
-对侧 `best_`，限价能交叉则吃 FIFO 头：`take = min(remaining, head->qty)`，成交价是 **maker 价**，然后 `apply_fill`（走 `level_handle`）。循环直到数量没了、对侧空了、或不再交叉。剩余走自己的 `add`。
-
-复杂度大约 O(*F* + 被打穿的档位数)。打穿 best 会 `close`+`rebase`。`fills` 向量可选，传入才会分配。
-
-### 3.6 `match_market`
-
-与限价相同，但交叉条件恒真（买用 `Price::max`，卖用 `Price::min` 当 cap）。剩余 **不挂**。
-
-### 3.7 best / 下一价
-
-有档时 `best_` 就是窗口 offset 0。`copy_top` 按 offset 0…255 扫环（跳过 0 句柄），不够再从冷区 leftmost/rightmost 叶用 ctz 走。近盘口 `top_n` 主要是环上的顺序扫描，不碰目录。跨页、远离 best 的深度仍是「叶链 + 每叶 bitmap」。
-
-### 3.8 开档 / 关档 / 热冷升降级
-
-| 事件 | 热 | 冷 |
-|---|---|---|
-| 第一档 | 原点 = 该价，写 `hot[0]` | 不动 |
-| 窗口内新档 | 写下标 | 不动 |
-| 窗口外更差的新档 | 不动 | `ensure_leaf` + bitmap set |
-| 新的更优价，Δ&lt;256 | 环转向更优一侧，远端 tick 迁出到 radix | 近端空槽可从 radix 偷回 |
-| 新的更优价，Δ≥256 | `rebuild_hot`：旧环按价格重放，再 `steal_cold_into_hot` | 旧窗口里更差的档全部在 radix |
-| 关掉非 best | 清该槽或 `radix_remove` | 叶空则回收 |
-| 关掉 best | 清槽，选下一档，旋转使它到 offset 0 | 新窗口远端从 radix 补 |
-
-升降级 **不** `acquire`/`release` `BookLevel`，只改索引。对象地址和 handle 保持稳定，所以已挂在上面的 `Order.level_handle` 仍然有效。
-
-Cache 直觉：exist / 近盘口 match 打在 `Order` 池、`OrderIdIndex`、256 个 handle 的环（1 KiB）上。Cold `open` 沿 7 个 2104 字节的 `DirNode` 走，稀疏跳价会连续 miss。叶 1080 字节，一页内的 ctz 扫描比跨很多 `DirNode` 便宜。
+1. 热环非空时：分 `[hot_base_, 256)` 与 `[0, hot_base_)` 两段读取 `hot_occ_[0..3]`，用 Kernighan `w &= (w - 1)` + `std::countr_zero` 仅访问非空档位（稠密 256 档横扫实测仅 **106 ns**）。
+2. 若仍未填满 `out` 且冷区非空：卖侧从 `min_leaf_` 沿 `next_leaf`、买侧从 `max_leaf_` 沿 `prev_leaf` 顺序遍历双向叶链，每叶用 `occ_lowest`/`occ_above`（或 `occ_highest`/`occ_below`）输出句柄。
 
 ---
 
 ## 4. Benchmark
 
-### 4.1 环境
+### 4.1 测试环境
 
-| 项 | 值 |
+| 项目 | 配置 |
 |---|---|
-| 日期 | 2026-11-19，America/New_York |
-| 代码 | `cursor/hot-cold-levels-352d` @ `b9430b7` |
-| 机器 | KVM，4 vCPU；`/proc/cpuinfo` `model name: Intel(R) Xeon(R) Processor`；CPUID Family 6 Model 207；AVX-512 |
-| 缓存（lscpu） | L1d 192 KiB / L2 8 MiB / L3 320 MiB（虚拟化，L3 按 host 切片报） |
-| 编译 | `g++-13` 13.3.0，CMake `Release`：`-O3 -DNDEBUG`，C++20，**无** `-march` |
-| 计时 | `std::chrono::steady_clock`；p50/p99/p99.9 是 **每个 batch 均值** 的分位数，5 个 rep 池在一起 |
-| 重复 | 默认 5 rep；exist 2000 batch × 128 ops；churn 400 × 16；sweep 500 × 8；sparse 128 × 16；match_touch 2000 × 64；match_walk8 400 × 16 |
-| 二进制 | `./build-bench/external_compare_bench`、`price_index_bench`、`page_param_sweep` |
+| 日期 | 2026-11-21（America/New_York, EST） |
+| 版本 | `PagedLOB` **v0.3.0**（分支 `cursor/pagedlob-perf-fixes-352d`） |
+| 机器 | KVM 4 vCPU，`Intel(R) Xeon(R) Processor`（CPUID Family 6 Model 207，AVX-512） |
+| 缓存 | L1d 192 KiB / L2 8 MiB / L3 320 MiB |
+| 编译器 | `g++-13` 13.3.0，CMake `Release`（`-O3 -DNDEBUG`，C++20，未加 `-march=native`） |
+| 计时方法 | `std::chrono::steady_clock`；p50 / p99 / p99.9 为 **每 batch 平均耗时** 在 5 轮（reps）样本池上的分位数 |
+| 评测程序 | `./build-bench/external_compare_bench`、`./build-bench/price_index_bench`、`./build-bench/page_param_sweep`、`./build-bench/fastlob_latency_hist` |
 
-其它 book 只在本表出现：内部 baseline（表中列名 `v1`）、[Liquibook](https://github.com/enewhuis/liquibook)、[Tzadiko Orderbook](https://github.com/Tzadiko/Orderbook)、[br-avl](https://github.com/brprojects/central-limit-order-book)。PagedLOB 的 `apply`/`add` 不撮合；`match_*` 行才走撮合。Liquibook / Tzadiko / br-avl 在 `add` 里撮合，所以 match 行调用的是它们的 `add`，限价交叉。v1 没有撮合 API，match 行无数据。
+对比对象包括：仓库内置平面基准 `v1`（`FastOrderBook`，哈希 + 排序双向档位链，无撮合入口）、[Liquibook](https://github.com/enewhuis/liquibook)、[Tzadiko Orderbook](https://github.com/Tzadiko/Orderbook)、[br-avl](https://github.com/brprojects/Limit-Order-Book)。
 
-`heap_bytes` 是 glibc `mallinfo2`（`uordblks + hblkhd`）在簿活着时的增量，含分配器开销。PagedLOB 的大数字主要是构造时的池，不是 live 图。`price_index_bench` 的字节列是 `sizeof` 加总，和 mallinfo **不是同一列**。
+### 4.2 负载说明
 
-exist / churn / sweep / sparse **不交叉**（单侧或买卖不撞）。价格为正且进 `int32`，避开 0（Liquibook 把 0 当市价）。
-
-### 4.2 每个负载测什么
-
-| 负载 | 测什么 |
+| 负载 | 含义 |
 |---|---|
-| `exist_seq` / `exist_shuffle` | 16384 单、**8 个已有价**。Batch 里 cancel 再以同价 add 回去。已有档热路径（id 哈希 + FIFO + 窗口 `find`）。shuffle 打乱 id 顺序。 |
-| `churn_1k` / `churn_10k` | 连续卖档滑动：撤 best，在远端再挂一档。开/关档 + best 移动。 |
-| `sweep_in_page` | 256 个相邻 tick，撤掉奇数档，反复 `top_n`。近盘口扫描（热环）。 |
-| `sweep_across` | 价差 256 tick，扫描跨很多页。冷区叶链。 |
-| `sparse_jump` | 2048 次插入，键在高位 radix digit 上分开；买侧每次都是新的 best。最坏目录分配 + 窗口重建。 |
-| `match_touch` | 一档卖一拍，限价买吃掉，再补一档卖。单档打穿再 `open`。 |
-| `match_walk8` | 64 档卖，每次吃 best 一拍，在当前最差价再补一档。沿 `best_` 走 FIFO。 |
+| `exist_seq` / `exist_shuffle` | 16,384 张挂单分布在 **8 个已有价位**，每步 `cancel` 后同价 `add`。考察稳态盘口热路径（ID 哈希 + 池 + 队列 + 热环命中）。 |
+| `churn_1k` / `churn_10k` | 1,000 / 10,000 个连续卖档不断撤掉 `best_` 并在远端新开一档。考察开/关档、窗口旋转与冷热边界晋升。 |
+| `sweep_in_page` | 256 个相邻 tick（撤掉奇数位留 128 档），反复 `top_n`。考察近盘口热环位图扫描。 |
+| `sweep_across` | 相邻档位相隔 256 tick（每页 1 档，共 128 页），反复 `top_n`。考察冷区跨页叶链遍历。 |
+| `sparse_jump` | 2,048 次高位 radix 分散插入，买侧每次均为更优新 `best_`。考察最坏稀疏冷区建树成本。 |
+| `match_touch` | 卖一挂 1 手 → 主动限价买单打穿吃光 → 再挂回卖一。考察单档打穿、空簿过渡与重开档。 |
+| `match_walk8` | 64 档连续卖盘，每次吃穿当前 `best_` 并在尾部补 1 档。考察连续吃盘口与旋转推进。 |
 
-### 4.3 对照表（`external_compare_bench`）
+### 4.3 外部订单簿横向对比（`external_compare_bench`）
 
-p50，单位见表头。**加粗是该行最低 p50。**
+同一次运行输出，p50 延迟（越低越好，**加粗为全场第一**；括号内标注相对外部开源最优的倍数）：
 
-| 负载 | 单位 | PagedLOB | v1 | liquibook | tzadiko | br-avl |
+| 负载 | 单位 | **PagedLOB v0.3** | v1 (flat) | Liquibook | Tzadiko | br-avl |
 |---|---|---:|---:|---:|---:|---:|
-| exist_seq | ns/call | 34.1 | 37.4 | 87.9 | 77.3 | **23.3** |
-| exist_shuffle | ns/call | 34.1 | 36.6 | 107.9 | 78.8 | **23.5** |
-| churn_1k | ns/churn | **98.6** | 1664.8 | 134.1 | 214.0 | 11137.4 |
-| churn_10k | ns/churn | **79.3** | 12894.6 | 148.1 | 232.2 | 103251.5 |
-| sweep_in_page | ns/sweep | 204.0 | **201.9** | 392.8 | 457.2 | 4502.2 |
-| sweep_across | ns/sweep | 1207.8 | **202.0** | 393.9 | 466.6 | 4506.3 |
-| sparse_jump | ns/insert | 951.2 | **15.2** | 95.6 | 196.3 | 5906.0 |
-| match_touch | ns/match | 79.5 | — | 66.3 | 113.1 | **52.8** |
-| match_walk8 | ns/match | **26.8** | — | 78.5 | 181.1 | 490.1 |
+| `exist_seq` | ns/call | **20.3** | 24.4 | 88.1 | 77.8 | 22.8 |
+| `exist_shuffle` | ns/call | **20.4** | 23.8 | 108.0 | 79.2 | 23.6 |
+| `churn_1k` | ns/churn | **62.1** | 1,445.7 | 131.9 | 214.9 | 11,228.0 |
+| `churn_10k` | ns/churn | **49.2** | 12,904.0 | 148.6 | 235.8 | 107,010.9 |
+| `sweep_in_page` | ns/sweep | **137.9** | 194.2 | 388.9 | 461.2 | 4,482.9 |
+| `sweep_across` | ns/sweep | 324.6 | **203.1** | 394.4 | 476.2 | 4,489.9 |
+| `sparse_jump` | ns/insert | 859.4 | **12.6** | 102.4 | 200.5 | 6,067.2 |
+| `match_touch` | ns/match | **15.2** | — | 66.3 | 120.4 | 57.8 |
+| `match_walk8` | ns/match | **23.2** | — | 79.8 | 192.8 | 492.0 |
 
-Mops 与 heap（同一次 run）：
+**与三款外部开源 C++ 订单簿（Liquibook / Tzadiko / br-avl）直接对比：9 项负载中 PagedLOB v0.3 拿下 8 项第一**（唯一例外是刻意构造最坏 7 层建树的 `sparse_jump`）。
 
-| 负载 | PagedLOB Mops | PagedLOB heap | br-avl p50 | br-avl heap |
-|---|---:|---:|---:|---:|
-| exist_seq | 28.98 | 1 447 392 | 23.3 ns | 1 477 024 |
-| churn_10k | 12.52 | 1 705 360 | 103251.5 ns | 1 923 760 |
-| match_walk8 | 35.31 | 23 077 616 | 490.1 ns | 10 528 |
+吞吐率、尾延迟与 `mallinfo2` 堆占用明细（同一次运行）：
 
-match 行 PagedLOB heap 大，是因为 harness 把订单池建成 `1<<18`，不是 64 档活着需要 23 MB。
+| 负载 | PagedLOB Mops/s | p50 | p99 | p99.9 | PagedLOB heap | 最快外部簿 p50 |
+|---|---:|---:|---:|---:|---:|---:|
+| `exist_seq` | **48.46** | 20.3 ns | 27.5 ns | 52.4 ns | 1.46 MB | 22.8 ns (br-avl) |
+| `exist_shuffle` | **48.33** | 20.4 ns | 27.4 ns | 65.2 ns | 1.45 MB | 23.6 ns (br-avl) |
+| `churn_1k` | **15.77** | 62.1 ns | 88.1 ns | 138.1 ns | 0.17 MB | 131.9 ns (Liquibook) |
+| `churn_10k` | **20.00** | 49.2 ns | 67.8 ns | 74.9 ns | 1.71 MB | 148.6 ns (Liquibook) |
+| `sweep_in_page` | **7.02** | 137.9 ns | 152.4 ns | 279.0 ns | 41.8 KB | 388.9 ns (Liquibook) |
+| `sweep_across` | **3.05** | 324.6 ns | 449.5 ns | 755.5 ns | 343.1 KB | 394.4 ns (Liquibook) |
+| `match_touch` | **49.62** | 15.2 ns | 51.8 ns | 69.7 ns | 23.08 MB* | 57.8 ns (br-avl) |
+| `match_walk8` | **41.44** | 23.2 ns | 35.3 ns | 84.6 ns | 23.08 MB* | 79.8 ns (Liquibook) |
 
-### 4.4 页宽 `PageBits` sweep
+*\*注：`match_*` 行 harness 预分配 `1<<18`（262,144）容量订单池，以容纳 2,000×64 批连续打单的新订单 ID，并非活跃结构泄漏。*
 
-`page_param_sweep`，同一套 exist / churn / walk / sparse，叶宽 32…1024 tick。hot window 固定 256 tick。p50：
+### 4.4 v0.2.0 → v0.3.0 优化前后对比
 
-| ticks | exist_seq | churn_10k | walk_dense | walk_1_per_page | sparse_jump | 叶字节 |
+在同一台机器、同一编译器与同一基准参数下，本轮架构改进与修复带来的实测变化：
+
+| 负载 | v0.2.0 (`b9430b7`) | **v0.3.0（当前）** | 加速比 | 主要贡献点 |
+|---|---:|---:|---:|---|
+| `exist_seq` | 34.1 ns (29.0 Mops) | **20.3 ns (48.5 Mops)** | **1.68×** | `OrderIdIndex` 单数组共置 + `take`/`find_empty_slot` 单次探测 |
+| `exist_shuffle` | 34.1 ns | **20.4 ns (48.3 Mops)** | **1.67×** | 同上 + Knuth R 无分支掩码回移 |
+| `churn_1k` | 98.6 ns | **62.1 ns (15.8 Mops)** | **1.59×** | `hot_occ_` O(1) 找下一档 + `min_leaf_` O(1) 冷热晋升 + `find_or_open` |
+| `churn_10k` | 79.3 ns (12.5 Mops) | **49.2 ns (20.0 Mops)** | **1.61×** | 同上 + `min_leaf_`/`max_leaf_` 端点快路径省去冷区爬树 |
+| `sweep_in_page` | 204.0 ns | **137.9 ns**（纯索引 bench **106.5 ns**） | **1.48×** | `hot_occ_` 逐字 `w &= (w - 1)` 替代 256 槽分支循环 |
+| `sweep_across` | 1,207.8 ns | **324.6 ns**（纯索引 bench **290.1 ns**） | **3.72×** | 冷区 `Leaf` 有序双向链表 + 首缓存行打包 `occ`/`prev`/`next` |
+| `sparse_jump` | 951.2 ns | **859.4 ns** | **1.11×** | 盘口变优跳过死冷区查询 + 回收叶免 `memset(handle)` |
+| `match_touch` | 79.5 ns | **15.2 ns (49.6 Mops)** | **5.23×** | 物理位图消除空簿 1 KiB `memset` 与 256 槽扫描 + 单次探测 |
+| `match_walk8` | 26.8 ns (35.3 Mops) | **23.2 ns (41.4 Mops)** | **1.16×** | `hot_occ_` O(1) 定位下一 `best_` + 单次探测撤单 |
+
+### 4.5 页宽 `PageBits` 参数扫描（`page_param_sweep`）
+
+固定 256-tick 热窗口，扫描冷区叶宽 `32..1024` tick（p50）：
+
+| 叶宽 (ticks) | 叶大小 | `exist_seq` | `churn_10k` | `walk_dense` | `walk_1_per_page` | `sparse_jump` |
 |---:|---:|---:|---:|---:|---:|---:|
-| 32 | 34.6 | 79.2 | 176.4 | **1038.0** | 1274.6 | 160 |
-| 64 | **33.9** | 79.2 | 188.1 | 1096.8 | **1242.3** | 288 |
-| 128 | 34.4 | **78.4** | 177.5 | 1086.4 | 1296.7 | 552 |
-| 256（默认） | 34.1 | 79.2 | **162.0** | 1112.5 | 1407.2 | 1080 |
-| 512 | 34.1 | 83.4 | 175.9 | 1150.2 | 1677.4 | 2136 |
-| 1024 | 36.4 | 78.6 | 177.0 | 1540.4 | 2128.4 | 4248 |
+| 32 | 184 B | 22.6 ns | 47.9 ns | 114.9 ns | 172.6 ns | 1,118.2 ns |
+| 64 | 312 B | 20.3 ns | **44.2 ns** | **106.4 ns** | **169.4 ns** | **996.3 ns** |
+| 128 | 576 B | 20.0 ns | 46.2 ns | **106.4 ns** | 226.9 ns | 1,040.4 ns |
+| **256（默认）** | 1,104 B | 20.1 ns | 47.5 ns | 106.6 ns | 375.6 ns | 1,160.4 ns |
+| 512 | 2,160 B | 20.2 ns | 48.3 ns | 107.2 ns | 490.6 ns | 1,417.9 ns |
+| 1024 | 4,272 B | **19.3 ns** | 48.6 ns | **106.4 ns** | 706.2 ns | 1,868.1 ns |
 
-exist / churn 几乎与页宽无关（热路径在窗口和订单池上）。稀疏和「一页一档」扫描随叶变大变慢、变占内存。默认 256 是密度和近盘口 walk 的折中，不是稀疏最优。
+结论：
 
-### 4.5 结构内存（`price_index_bench`）
+- 近盘口负载（`exist_seq` ~20 ns、`walk_dense` ~106 ns）对页宽不敏感，因为全部命中 256-tick 热环。
+- 有序双向叶链让 `walk_1_per_page` 从 v0.2 的 `1,038~1,540 ns` 大幅降至 `169~706 ns`；若业务需要频繁在跨度极宽的稀疏盘口上做深层快照，可选用 `PagedStorageBookT<6>`（64 tick/叶，**169.4 ns**）。默认保持 `PageBits=8`（256 tick），兼顾 7 层浅树与中等密度页容。
 
-`sizeof` 加总，不含 malloc 圆整。PagedLOB `price index bytes` 含目录 free-list 储备。
+### 4.6 结构内存对比（`price_index_bench`）
 
-| 负载 | PagedLOB price bytes | PagedLOB total | v1 price bytes | v1 total |
-|---|---:|---:|---:|---:|
-| exist_seq | 6 256 | 1 449 368 | 2 048 | 1 445 632 |
-| churn_10k | 62 080 | 1 546 408 | 1 048 576 | 2 692 864 |
-| sparse_jump | 11 106 416 | 11 368 600 | 131 072 | 425 984 |
+结构 `sizeof` 精确加总（不含 `malloc` 对齐圆整，含内部 free-list 储备）：
 
-稀疏时 PagedLOB 为每条远离的 best 留一条 radix 路径，**结构字节比 v1 高两个数量级**。这和 §4.3 里 mallinfo 的 6.9 MB vs 0.46 MB 是同一现象。
-
-同 harness 下 exist_seq p50：PagedLOB 32.4 ns，v1 32.7 ns（价格含 0，适配器更薄）。对外比请用 §4.3。
-
----
-
-## 5. 已知弱点与后续方向
-
-1. **exist 仍慢于 br-avl**（34.1 vs 23.3 ns/call）。窗口已经让 `find(price)` 变成下标；剩下的是 `OrderIdIndex` 探测、`erase` 的 `rehash_from`、以及 br 订单上的父档指针 + 更浅的价位哈希。要追 24 ns 得动 id 索引或把「最后一档」缓存在订单路径上，不是再加一层价位目录。
-2. **稀疏新 best 又慢又肥**。每次插入重建或旋转窗口，并沿 7 层 `DirNode`（每个 2104 B）分配。v1 把新 best 链到链表头，§4.3 里是 15.2 vs 951.2 ns/insert。
-3. **跨页 `top_n`**（`sweep_across` 1208 ns）比链表 baseline（202 ns）和 Liquibook（394 ns）慢。冷区要跳叶，热环帮不上跨度 ≫256 tick 的深度图。
-4. **`match_touch` 慢于 br-avl / Liquibook**（79.5 vs 52.8 / 66.3）。打穿唯一一档等于 `close`+空簿+再 `open`，付一次窗口安装。沿 best 连吃（`match_walk8`，26.8 ns）这条路径是强项。
-5. **`steal_cold_into_hot` 反复 `compute_best_cold`**。一次大跳若把很多冷档拉进窗口，会变成 O(*W*·*H*)。
-6. **Python 和 Execution Simulator 仍未使用 PagedLOB。**
-7. **无锁、无 STP、无改价。** 多线程和交易所语义都还没做。
+| 负载 | PagedLOB 价格索引字节 | PagedLOB 总字节 | `std::map` 总字节 | `v1` 价格索引字节 | `v1` 总字节 |
+|---|---:|---:|---:|---:|---:|
+| `exist_seq` | 6,320 B | 1.45 MB | 1.44 MB | 2,048 B | 1.45 MB |
+| `churn_10k` | 63,104 B | 1.55 MB | 1.96 MB | 1.05 MB | 2.69 MB |
+| `sweep_in_page` | 6,320 B | 39.4 KB | 39.3 KB | 32.8 KB | 70.1 KB |
+| `sparse_jump` | 11.16 MB | 11.42 MB | 360.5 KB | 131.1 KB | 426.0 KB |
 
 ---
 
-## 6. Review 发现
+## 5. 当前已知边界与后续演进方向
 
-通读 `paged_price_index.hpp`、`storage_book.hpp`、`level_pool.hpp`、`memory_pool.hpp`、`order.hpp`、`price_key.hpp` 和测试。**只报告，本 PR 不改代码。** 差分测试（含随机流、热冷边界、撮合）是绿的；下面不是「测试正在失败」，是读代码看到的风险和缺口。
-
-### 中
-
-1. **`match_limit` 部分成交后 rest 失败没有回滚。** `match_incoming` 先 `apply_fill`，再 `add` 剩余。若订单池在 rest 时耗尽：`ok==false`、`rested==false`，但 maker 侧已经扣过。调用方如果只看 `ok` 会以为没动。没有覆盖「打完再挂时池满」的测试。
-2. **NDEBUG 下 `OrderIdIndex` 满表可能死循环。** `insert`/`find`/`erase` 靠空槽（`kInvalidOrderId`）结束探测。`assert(size_ < capacity_)` 在 Release 里消失。正常 `max_orders*2` 的容量让 live 订单先撞 `OrderPool`，所以这是容量约定被打破时的 Release 风险，不是当前 bench 路径。
-3. **`close`/`radix_remove` 在 Release 里信任不变量。** 叶缺失时 `find_leaf` 返回空，下一句解引用。Debug 有 assert。不变量靠测试维持。
-
-### 低
-
-4. **`StorageBook::find` 返回 `Order` 值拷贝**，里面的 `prev`/`next` 指向池内节点。用这些指针改簿是 UAF 等待发生。应当成快照，不当成句柄。
-5. **热环 `copy_top` 没有 occupancy bitmap**，最坏扫 256 个槽。`top_n(1)` 在 offset 0 有 best 时是 O(1)；窗口很空、`out` 又很大时会扫满 *W*。
-6. **跳价 `rebuild_hot` + `steal_cold_into_hot` 的复杂度** 见 §5.5。正确性靠「每个档只在热或冷一侧」；随机流会抓住双计，但大跳的成本没有专门测。
-7. **`LevelPool::handle_of` 对非本池指针是 UB**（指针相减）。纯内部 API。
-
-### 测试缺口
-
-8. 没有 PagedLOB 撮合与 Liquibook/br-avl **交叉** 的差分（现有 external 测试只对不交叉深度）。
-9. 没有 hot window 贴着 `INT64_MAX` / 卖侧原点 +255 溢出的单测（有 `INT64_MIN` 页编码测试）。
-10. 没有 `match_market` 空簿、重复 taker id、部分成交后池耗尽。
-11. 仓库里 **没有** `.github/workflows`；asan/ubsan 是 CMake 选项，不是默认 CI。
-
-### 未当成 bug 的设计点
-
-- `apply` 不撮合，两侧可以锁在同一价。有单测 `ApplyDoesNotMatch`。
-- 没有自成交预防。
-- 市价吃不完的数量只出现在 `MatchResult.remaining` 里，不挂。
+1. **极端稀疏远跳插入（`sparse_jump`）仍是结构性取舍**（859 ns / 11.16 MB vs `Liquibook` 102 ns / 0.44 MB）：未压缩的 8-bit 固定步长 radix 在高位分散键上会为每条孤立路径分配 6 个 `DirNode`（每个 2,104 B）。后续若需兼顾全范围随机跳价，可引入 **自适应路径压缩（ART Node4/Node16/Node48 + 单子前缀折叠）**，将稀疏内存降低一个数量级以上。
+2. **跨页 `sweep_across` 略慢于纯平面链表 `v1`**（324.6 ns vs `v1` 203.1 ns，但已快于 `Liquibook` 394.4 ns 与 `std::map` 385.2 ns）：`v1` 直接串接 `BookLevel*`（每档 40 B），而冷区叶链每页需先读 `Leaf` 首缓存行位图再通过 `LevelPool` 取 `BookLevel`。
+3. **交易所微观规则与并发包装**：目前不含 STP（自成交预防）、Post-Only / IOC / FOK 订单属性、原地改价及单写多读 SeqLock 快照发布层，可按需在 `StorageBook` 外层或策略参数中扩展。
 
 ---
 
-## 7. 附录：简历素材
+## 6. v0.2 代码审查问题闭环清单
 
-数字全部来自 [§4.3](#43-对照表external_compare_bench) / [§4.5](#45-结构内存price_index_bench)。对照对象和负载写在句子里。不要把 exist 写成赢了 br-avl，那次 run 没有赢。
+上一版（v0.2.0）架构审查列出的全部性能瓶颈、正确性隐患与工程缺口已在 **v0.3.0** 逐项闭环：
 
-### 7.1 Resume bullets（英文）
-
-- Designed PagedLOB, a C++20 in-memory L3 book with an 8-bit radix over 256-tick leaves and a 256-tick hot handle ring around `best_`, keeping MBO `apply()` unmatched and exposing a separate `match_limit` / `match_market` path.
-- On a 4-vCPU KVM Intel Xeon, GCC 13.3 `-O3`, same harness as three public books: PagedLOB p50 **79.3 ns/churn** on `churn_10k` vs **103,252 ns** br-avl and **12,895 ns** the hash+list baseline (5 reps, percentiles of per-batch means).
-- Near-touch `top_n` (`sweep_in_page`) p50 **204 ns** vs **393 ns** Liquibook and **4,502 ns** br-avl; aggressive matching along `best_` (`match_walk8`) **26.8 ns** vs **490 ns** br-avl, same machine and binary.
-- Existing-level cancel+add (`exist_seq`, 16,384 orders on 8 prices) p50 **34.1 ns** vs **23.3 ns** br-avl — the hot ring removed the radix walk; the remaining gap is OrderId hashing, not price lookup.
-- Pre-sized order/level/id pools: `churn_10k` structural footprint **1.55 MB** vs **2.69 MB** hash+list (`price_index_bench`); sparse far-from-touch inserts still allocate 7-deep directory nodes (**951 ns**, **11 MB** index vs **15 ns**, **0.13 MB** on that baseline).
-
-### 7.2 面试里容易被追问的问题
-
-**为什么是页 + radix，而不是一棵树或全量哈希？**  
-哈希找不到「下一档」，滑动盘口和 `top_n` 会变成按价排序。树是 O(log *L*) 且节点堆分配。页把相邻 tick 收成一张 occupancy bitmap，ctz 扫一页；radix 只在页键上走固定 7 步。稀疏跳页仍然贵（§4.3 `sparse_jump`），这是故意拿稠密/滑动换稀疏。
-
-**hot window 为什么是 256-tick 环，不是「最近用过的价」哈希？**  
-环保持 **best 起的价格顺序**，`copy_top` 和撮合沿 offset 走就能按档顺序输出。哈希还要再排序，也保证不了「窗口内空槽 = 没有档」，`find` 就不能在 miss 时跳过 radix。互斥分层让近盘口 `find` 真正 O(1)。代价是 best 移动必须升降级（§3.8）。
-
-**为什么 `apply` 不撮合？**  
-MBO 回放的成交已经在 feed 里。再撮一次会和交易所簿分叉。主动单走 `match_*`。简历里可以说「exchange-faithful replay 和 matching engine 分成两条 API」。
-
-**exist 为什么还是输给 br-avl？**  
-这次 run：34.1 vs 23.3 ns。价位查找已经不是主因（8 个价都在热环里）。br 的订单带父档指针，价位哈希更浅；PagedLOB 的 cancel 仍要开放寻址 `erase`+`rehash_from`。追 exist 要动 `OrderIdIndex` / 订单布局，不是再加目录层。诚实回答比假装窗口已经打平更有用。
+| # | v0.2 审查发现 | 严重度 | v0.3.0 处理结果 |
+|---:|---|---|---|
+| 1 | `match_limit` 容量边界与 `add` 双重哈希探测/回滚风险 | 中 | **已修复**：`add` 前置检查 `pool_.free_count()`，`find_or_open` 在 `LevelPool` 满时零副作用返回；`find_empty_slot` + `commit_slot` 单次探测；新增 `Match.TightCapacityPartialAndDrainRest` 覆盖吃穿释放即复用与满池拒绝 |
+| 2 | `NDEBUG` 下 `OrderIdIndex` 满表可能无限探测死循环 | 中 | **已修复**：`insert` / `find_empty_slot` 检查 `size_ >= capacity_`，所有探测循环增加 `step < capacity_` 硬上界；新增 `Match.FindScrubsInternalLinksAndFullIdIndexTerminates` |
+| 3 | `radix_remove` 在 `NDEBUG` 下对缺失叶直接空指针解引用 | 中 | **已修复**：保留 Debug `assert` 同时增加 Release 空指针防御返回 |
+| 4 | `StorageBook::find` 返回的 `Order` 暴露池内 `prev`/`next`/`level_handle` | 低 | **已修复**：返回快照前统一清零内部链接与句柄字段 |
+| 5 | 热环无位图，`match_touch` 空簿触发 1 KiB `memset` 与 256 槽空扫 | 高（性能） | **已修复**：引入物理位图 `hot_occ_[4]` + `hot_count_`，`match_touch` 从 **79.5 ns → 15.2 ns（5.23×）**，`sweep_in_page` 从 **204.0 ns → 137.9 ns** |
+| 6 | 盘口变优与大跳时死冷区查询 + `steal_cold_into_hot` O(*W*·*H*) | 中（性能） | **已修复**：`promote_better_origin` 跳过数学上不可能命中的冷区拉取；冷区 `Leaf` 维护有序双向链表，`steal_cold_into_hot` 每档 O(1)，`sweep_across` 从 **1,207.8 ns → 324.6 ns（3.72×）** |
+| 7 | `OrderIdIndex` 键值分拆双数组 + `add`/`cancel` 二次探测 | 高（性能） | **已修复**：合并为 16B `Entry` 单数组 + 单乘法哈希 + `take`/`find_empty_slot`，`exist_seq` 从 **34.1 ns → 20.3 ns（反超 `br-avl` 与 `v1`）** |
+| 8 | `__builtin_ctzll`/`__builtin_clzll` 非标准扩展 + `LevelView::qty` 32-bit 截断 | 低（移植/正确性） | **已修复**：全面切换至 C++20 `<bit>`（`std::countr_zero` / `std::countl_zero`）；引入 64-bit `LevelQty`，新增 `> UINT32_MAX` 聚合测试 |
+| 9 | 缺少外部簿交叉撮合差分、`INT64_MAX` 热窗边界、`match_market` 空簿/重 ID 测试 | 测试 | **已补齐**：新增 `expect_crossing_books_agree`（对齐 `Liquibook` 与 `br-avl`）、`HotCold.Int64ExtremesAndLargeLevelQty`、`MatchBook.MarketEmptyAndDuplicateIdEdgeCases`、`ZeroAlloc.PagedLobHotAndReservedColdPaths` |
+| 10 | `ExecutionSimulator` 与 `pyfastlob` 未接入 `PagedLOB`，仓库无 CI | 工程 | **已补齐**：`ExecutionSimulator<Book = PagedLOB>` 模板化并默认绑定 `PagedLOB`；`pyfastlob` 切换至 `PagedLOB` 并导出 `match_limit`/`match_market`；新增 `.github/workflows/ci.yml`（Release 零分配探针 + ASan/UBSan 矩阵） |
 
 ---
 
-## 修订
+## 7. 附录：简历素材与面试问答
 
-| 日期 | 内容 |
-|---|---|
-| 2026-11-19 | 按 `b9430b7` 栈顶写成；基准为同日重跑。 |
+### 7.1 Resume Bullets（英文，基于 v0.3.0 实测数据）
+
+- Architected **PagedLOB**, a C++20 zero-allocation in-memory L3 limit order book combining a **256-tick bitmap-indexed hot handle ring** around `best_` with an **8-bit radix tree + cache-line-packed intrusive doubly-linked leaf list** for cold depth, cleanly separating event-faithful MBO replay (`apply`) from price-time matching (`match_limit` / `match_market`).
+- Engineered a single-array open-addressed `OrderIdIndex` (16-byte co-located entries, single-probe `take`/`commit_slot`, branchless Knuth Algorithm R backshift) and `Order.level_handle` direct pooling, reaching **20.3 ns p50 (48.5 Mops/s)** on steady-state cancel+add (`exist_seq`) and **15.2 ns p50 (49.6 Mops/s)** on top-of-book crossing (`match_touch`) on 4-vCPU Intel Xeon (GCC 13.3 `-O3`).
+- Outperformed three open-source C++ order books (**Liquibook**, **Tzadiko**, **br-avl**) on **8 of 9 benchmarks** in a unified harness: **3.0×–2,175× faster** on 10k-level sliding churn (**49.2 ns** vs 148.6 ns Liquibook / 107 µs br-avl), **3.8×–7.9× faster** on touch matching, and **2.8×–32× faster** on near-touch L2 depth sweeps (**137.9 ns**), verified under differential tests and ASan/UBSan CI.
+
+### 7.2 面试高频追问
+
+**1. 为什么用「256-tick 热环 + 冷区页式 Radix + 双向叶链」，而不是红黑树或纯哈希表？**  
+纯哈希表无法 O(1) 找下一档，盘口被打穿或输出 `top_n` 时会退化成全量扫描/排序；平衡树（`std::map` / AVL）每次开档和深度遍历都有指针追逐与旋转开销。真实市场 95%+ 的挂撤单集中在 `best_` 附近几十个 tick 内：256-tick 热环让近盘口寻址变成 L1 缓存内的数组下标，物理占用位图 `hot_occ_[4]` 让找下一档和 `top_n` 变成 4 个 `uint64` 上的 `tzcnt`；而超出 256 tick 的远端挂单落入按页聚合的 Radix 叶，既保证任意价格 O(*H*) 点查，又通过叶首缓存行的 `prev_leaf`/`next_leaf` 链支持 O(1) 冷热晋升与顺序跨页横扫。
+
+**2. 为什么 `hot_occ_` 按物理槽位编号而不是按距离 `best_` 的逻辑偏移编号？**  
+如果按逻辑偏移编号，`best_` 每挪动 1 tick 就得把 256-bit 位图整体跨 `uint64` 移位；按物理环槽位编号后，旋转 `hot_base_` 只是改一个整数，位图完全不动。按价格序遍历只需先扫 `[hot_base_, 256)` 再扫 `[0, hot_base_)` 两段单调物理区间即可，兼顾 O(1) 旋转与零 `memset`。
+
+**3. 这套结构最怕什么负载？怎么改进？**  
+最怕全 `int64` 空间随机大幅跳价（`sparse_jump`，859 ns/insert，结构内存 11 MB）：每条孤立远价会展开 6 层 2,104B 的 `DirNode`。工程上如果标的可能出现极端分散报价，可以把固定 256 路 `DirNode` 替换为 ART（Adaptive Radix Tree，`Node4/16/48/256` + 路径压缩），在保持热环速度不变的前提下把冷区稀疏内存压低一个数量级以上。
+
+---
+
+## 8. 版本演进日志（Changelog）
+
+> **文档维护约定**：每次对 `PagedLOB` 数据结构、关键路径、API 或基准测试做版本改动时，必须同步更新正文对应章节，并在本节顶部或底部追加一条版本记录（含日期、版本号/提交、核心改动与关键基准变化）。
+
+### v0.3.0 — 2026-11-21（America/New_York, EST）
+- **核心性能改进**：
+  - `OrderIdIndex` 重构为单数组 `Entry{OrderId, Order*}`（16B 共置），采用单乘法 64-bit 混合哈希、无分支掩码 Knuth Algorithm R 回移，并提供单次探测 `find_empty_slot`+`commit_slot`、`take`、`find_with_slot`+`erase_slot`，消除 `add`/`cancel`/`execute` 双重哈希探测。
+  - `PagedPriceIndex` 为 256-tick 热环引入物理槽占用位图 `hot_occ_[4]` 与 `hot_count_`，消除空簿过渡时的 1 KiB `memset` 与 256 槽线性空扫；`copy_top` 热环改用逐字 `w &= (w - 1)` 扫描；新增 `find_or_open` 将冷区开档树遍历减半；`promote_better_origin` 省去盘口变优时不可能命中的死冷区查询。
+  - 冷区 `Leaf` 增加按 `page_key` 升序维护的侵入式双向链表（`min_leaf_`/`max_leaf_`/`prev_leaf`/`next_leaf`）并将叶头元数据与 `occ[4]` 打包进首条 64B 缓存行，使 `compute_best_cold()`、`steal_cold_into_hot()` 降为 O(1)，跨页 `copy_top` 直接顺序走叶链；新增 `reserve` / `reserve_cold` 支持冷区节点预分配。
+- **正确性修复与工程完善**：
+  - 用标准 C++20 `<bit>`（`std::countr_zero` / `std::countl_zero`）替换 GCC/Clang 专属内建函数。
+  - 新增 64-bit `LevelQty` 类型并用于 `level_qty()` 与 `LevelView::qty`，消除超 `UINT32_MAX` 档位聚合截断。
+  - 修复 `OrderPool::allocate`、`OrderIdIndex` 满表探测、`radix_remove` 在 `NDEBUG` 下的安全边界，以及紧容量下 `match_limit` 吃穿复用的池检查顺序；`StorageBook::find()` 返回值擦除内部指针与句柄。
+  - `ExecutionSimulator` 模板化并默认接入 `PagedLOB`；`pyfastlob` 切换到底层 `PagedLOB` 并导出 `match_limit` / `match_market`；新增 GitHub Actions CI（`.github/workflows/ci.yml`，含 `ScopedAllocProbe` 与 `ASan+UBSan`）及外部簿交叉撮合差分测试。
+- **基准变化（相对 v0.2.0）**：`match_touch` **79.5 → 15.2 ns（5.23×）**，`sweep_across` **1,207.8 → 324.6 ns（3.72×）**，`exist_seq` **34.1 → 20.3 ns（1.68×，反超 `br-avl` 与 `v1`）**，`churn_10k` **79.3 → 49.2 ns（1.61×）**，`sweep_in_page` **204.0 → 137.9 ns（1.48×）**；外部横向对比 9 项负载赢下 8 项。
+
+### v0.2.1（Docs & Cleanup）— 2026-11-19 ~ 2026-11-20（America/New_York, EST）
+- **对应提交**：`bac864c`、`fc13bc9`、`cadeee8`
+- **改动内容**：撰写初版 `docs/pagedlob-architecture.md` 与 `README.md`，记录 `b9430b7` 栈顶架构、完整基准表与第一轮代码审查风险清单；清理仓库遗留旧命名标签。
+
+### v0.2.0（Hot / Cold Split）— 2026-11-19（America/New_York, EST）
+- **对应提交**：`b9430b7`（*Split PagedLOB prices into a hot window and cold radix*）
+- **改动内容**：在 `PagedPriceIndex` 中引入围绕 `best_` 的 256-tick 旋转句柄环（hot window），与远端 8-bit 冷区 radix 形成互斥分层，消除近盘口 `find` / `top_n` 的 7 层目录遍历。
+- **基准变化**：近盘口 `sweep_in_page` 追平平面结构（204 ns），`churn_10k` 达 **79.3 ns**，`match_walk8` 达 **26.8 ns**；但也暴露了空簿重开档 `match_touch`（79.5 ns）和冷区跨页 `sweep_across`（1,207.8 ns）的短板（后于 v0.3.0 解决）。
+
+### v0.1.3（Level Handles & Matching Engine）— 2026-11-19（America/New_York, EST）
+- **对应提交**：`6f7adb8`（*Add level handles and a matching path on PagedLOB*）
+- **改动内容**：引入索引稳定的 `LevelPool`（32-bit handle）并在 `Order` 中保存 `level_handle`，使 `cancel` / `modify` / `execute` 不再二次查价；在 `StorageBook` 上新增主动撮合入口 `match_limit` 与 `match_market`，保持与非撮合回放入口 `apply()` 分离。
+
+### v0.1.2（Leaf Width Parameter Sweep）— 2026-11-19（America/New_York, EST）
+- **对应提交**：`96578c9`（*Sweep PagedLOB leaf width from 32 to 1024 ticks*）
+- **改动内容**：将页宽泛化为编译期模板参数 `PageBits`（支持 32..1024 tick/叶），新增参数扫描基准 `page_param_sweep` 与多页宽单元测试 `page_param_test`，确立默认 `PageBits=8`（256 tick）。
+
+### v0.1.1（Paged Radix Directory & External Harness）— 2026-11-19（America/New_York, EST）
+- **对应提交**：`6600810`、`c78c611`
+- **改动内容**：实现首版基于符号翻转 `int64` 键、8-bit radix 目录与位图叶节点的分页限价簿，正式命名为 `PagedLOB`；搭建统一外部对比基准框架 `external_compare_bench` 与差分校验，接入 `Liquibook`、`Tzadiko Orderbook`、`br-avl`。
+
+### v0.1.0（Initial Baseline）— 早期基线
+- **改动内容**：实现 `ReferenceOrderBook`（`std::map` + `std::list` 黄金参考簿）、`FastOrderBook`（`v1`：预分配 `OrderPool` + 开放寻址哈希 + 排序双向档位链表，深盘滑动退化为 O(*L*)）、合成 MBO 事件流生成器、`ExecutionSimulator` 与 `ScopedAllocProbe` 零分配探针。
