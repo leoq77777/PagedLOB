@@ -1,21 +1,21 @@
 # PagedLOB
 
-**PagedLOB is a C++20 high-update-rate, zero-hot-allocation in-memory L3 limit order book (v0.4.0).** The nearest 256 ticks from `best_` sit in a bitmap-indexed hot handle ring (`hot_handle_[256]` + physical occupancy bitmap `hot_occ_[4]`); deeper prices live on `2^PageBits`-tick cold leaves (default `PageBits=8`, 256 ticks) indexed by an 8-bit radix tree for point lookups and linked into a cache-line-packed sorted doubly-linked leaf list for O(1) cold-to-hot promotion and fast cross-page depth sweeps. Includes a native streaming **NASDAQ TotalView-ITCH 5.0** binary parser & normalizer (`include/fastlob/itch50.hpp`).
+**PagedLOB is a C++20 high-update-rate, zero-hot-allocation in-memory L3 limit order book (v0.5.0).** Every active price level resides permanently in its aligned `2^PageBits`-tick bitmap `Leaf` page (default `PageBits=8`, 256 ticks; first 64-byte cache line packs `occ[4]`, `page_key`, and sorted doubly-linked `prev_leaf`/`next_leaf`), eliminating hot-cold level migration under wide volatility spikes. A **three-tier zero-migration page cache** (`best_leaf_` + MRU `hot_leaf_` + `near_dir_` covering 256 adjacent pages = 65,536 ticks) resolves near-touch and wide-volatility lookups in $O(1)$, `BookLevel::owner_page` closes depleted levels in strict $O(1)$ without radix walks, and **tagged single-leaf path compression** (`uintptr_t | 1`) avoids intermediate `DirNode` chains on sparse subtrees. Includes a native streaming **NASDAQ TotalView-ITCH 5.0** binary parser (`include/fastlob/itch50.hpp`) and a zero-shadow C ABI adapter (`adapters/matching_engine_benchmark/`) for [`flash1-dev/matching-engine-benchmark`](https://github.com/flash1-dev/matching-engine-benchmark).
 
-The primary C++ type is `fastlob::PagedLOB` (`StorageBook<PagedPriceIndex<8, 256>>`, customizable via `PagedStorageBookT<PageBits, HotTicks>`). Full architecture notes, engineering review closure, and version-by-version changelog: [docs/pagedlob-architecture.md](docs/pagedlob-architecture.md).
+The primary C++ type is `fastlob::PagedLOB` (`StorageBook<PagedPriceIndex<8, 256>>`, customizable via `PagedStorageBookT<PageBits>`). Full architecture notes, engineering review closure, and version-by-version changelog: [docs/pagedlob-architecture.md](docs/pagedlob-architecture.md).
 
 ## Architecture
 
-- **Two-tier price directory (`PagedPriceIndex<PageBits, HotTicks>`)**:
-  - **Hot window**: 256-entry ring of 32-bit `LevelPool` handles anchored at `best_` plus a physical-slot occupancy bitmap `hot_occ_[4]` (`std::countr_zero` / `w &= (w - 1)` via C++20 `<bit>`). Gives O(1) array lookup on near-touch orders, O(1) ring rotation without shifting bitmap words, and zero `memset` on empty-book transitions.
-  - **Cold radix + sorted leaf list**: 8-bit radix over the sign-flipped `int64` tick (`DirNode` free-list recycled) down to `2^PageBits`-tick `Leaf` pages whose first 64-byte cache line packs `occ[4]`, `page_key`, `prev_leaf`, `next_leaf`, and `parent`. Gives O(1) `min_leaf_`/`max_leaf_` boundary checks and promotion without climbing directory nodes.
+- **Zero-migration unified price directory (`PagedPriceIndex<PageBits>`)**:
+  - **Aligned bitmap `Leaf` pages**: 256-tick `Leaf` (`sizeof(Leaf) == 1104`), packing `occ[4]`, `page_key`, `prev_leaf`, `next_leaf`, and `parent` in cache line 0 followed by 32-bit `LevelPool` handles (`handle[256]`). Levels never migrate between structures when `best_` jumps or reverts.
+  - **Three-tier page cache**: Tier 0 checks `best_leaf_` and MRU `hot_leaf_` (512 ticks across page boundaries in $O(1)$); Tier 1 indexes `near_dir_` (`depth = kLastDirDepth`, covering `256 × 256 = 65,536` consecutive ticks in a single array load); Tier 2 walks an 8-bit sign-flipped radix tree with **tagged single-leaf path compression** (`uintptr_t | 1`) and automatic 1-leaf chain collapse on empty.
 - **Order, level, and ID storage (`StorageBook`)**:
-  - Pre-sized `OrderPool` (`sizeof(Order) == 56`), `LevelPool` (`sizeof(BookLevel) == 40`, 64-bit `LevelQty` preventing >4B aggregate overflow), and single-array open-addressed `OrderIdIndex` (`sizeof(Entry) == 16`, single-probe `find_empty_slot`+`commit_slot` and `take`, branchless Knuth Algorithm R backshift).
-  - `Order.level_handle` resolves `BookLevel*` in O(1) on `cancel`, `modify`, `execute`, and maker fills without a second price lookup.
-- **Separate replay vs matching APIs**:
+  - Pre-sized `OrderPool` (`sizeof(Order) == 56`), `LevelPool` (`sizeof(BookLevel) == 48` with `owner_page` back-pointer + 64-bit `LevelQty`), and single-array open-addressed `OrderIdIndex` (`sizeof(Entry) == 16`, single-probe `find_empty_slot`+`commit_slot` and `take`, branchless Knuth Algorithm R backshift).
+  - `Order.level_handle` + `BookLevel.owner_page` resolve `cancel`, `cancel_ex`, `modify`, `execute`, and maker fills in strict $O(1)$ with zero price-index traversal.
+- **Separate replay vs zero-allocation matching APIs**:
   - `apply(BookEvent)` (`add` / `cancel` / `modify` / `execute`) never matches, keeping MBO feed replay event-faithful.
-  - `match_limit` / `match_market` walk opposite `best_` and FIFO at maker prices; limit remainders rest, market remainders do not.
-- **Verification**: 57 unit/differential tests + external differential checks against `ReferenceOrderBook` (`std::map`), `Liquibook`, `Tzadiko`, and `br-avl` (both non-crossing depth and crossing `match_limit` streams), `ScopedAllocProbe` zero-allocation assertions on hot and reserved-cold paths, and ASan + UBSan CI (`.github/workflows/ci.yml`).
+  - `match_limit_cb` / `match_ioc_cb` / `match_market_cb` (inline template fill callbacks) and `match_limit` / `match_ioc` / `match_market` walk opposite `best_` and FIFO at maker prices; `cancel_ex` returns `{ok, side, price, qty}` directly from `OrderPool`.
+- **Verification**: 65 unit/differential tests + external differential checks against `ReferenceOrderBook` (`std::map`), `Liquibook`, `Tzadiko`, and `br-avl`, **34/34** conformance cases + **50/50** multi-seed audit cells in `matching-engine-benchmark`, `ScopedAllocProbe` zero-allocation assertions, and ASan + UBSan CI (`.github/workflows/ci.yml`).
 
 ## Build & Run
 
@@ -33,93 +33,90 @@ Benchmarks (Release, `-O3 -DNDEBUG`):
 ./build/page_param_sweep
 ./build/fastlob_latency_hist
 ./build/itch_replay_bench /path/to/12302019.NASDAQ_ITCH50.gz --symbols=AAPL,SPY,MSFT
+# Build C ABI shared library for flash1-dev/matching-engine-benchmark:
+MEB_DIR=/path/to/matching-engine-benchmark ./adapters/matching_engine_benchmark/build.sh
 # Or run bare-metal Linux perf_event_open PMU + ITCH benchmarks over SSH:
 ./scripts/run_remote_perf.sh <ssh-host> [--download-itch]
 ```
 
 Sanitizers: `-DFASTLOB_SANITIZER=asan+ubsan -DFASTLOB_ENABLE_ALLOC_PROBE=OFF` (or `asan` / `ubsan` / `tsan`).
 
-## Benchmarks (v0.4.0)
+## Benchmarks (v0.5.0)
 
-Measured on **2026-11-21 (America/New_York, EST)**: KVM 4 vCPU Intel Xeon (`Intel(R) Xeon(R) Processor`, Family 6 Model 207), `g++-13` 13.3.0, CMake Release (`-O3 -DNDEBUG`, C++20, no `-march`). Timer: `std::chrono::steady_clock`; reported numbers are **p50 / p99 / p99.9 of per-batch means** pooled across 5 reps.
+Measured on **2026-11-21 (America/New_York, EST)**: KVM 4 vCPU Intel Xeon (`Intel(R) Xeon(R) Processor`, Family 6 Model 207), `g++-13` 13.3.0.
 
-### Real Market Replay — NASDAQ TotalView-ITCH 5.0 (`itch_replay_bench`)
+### 1. Public `flash1-dev/matching-engine-benchmark` (5 Regimes, Worst-Case Ranked)
+
+Evaluated via `adapters/matching_engine_benchmark/pagedlob_adapter.cpp` (zero external `g_side`/`g_price`/`g_slot_id` shadow arrays; **34/34** edge-case conformance checks `PASS`, **5/5** canonical SHA-256 report hashes + **960/960** book-state audits `PASS`, **50/50** random seed × scenario cells `PASS`; 5-trial median throughput in **M msgs/s** via `scripts/run_challenge.py --perf-runs 5 --compare`):
+
+| Engine | Structure | `static` | `normal` | `swing-25` | `swing-40` | `flash-crash` | **Worst-Case M/s** | Verdict |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
+| **PagedLOB v0.5.0** | **Zero-migration paged radix + 16B hash** | **17.12** | **11.38** | **12.03** | **10.34** | 10.70 | **10.34** (`swing-40`) | **VALID** |
+| `lcv3` (LC++ v3) | Treap + external slot/price arrays | 16.87 | 8.64 | 9.88 | 9.57 | **10.75** | 8.64 (`normal`) | VALID |
+| `cpp_orderbook` | Red-black tree + hash | 6.45 | 6.75 | 5.71 | 5.94 | 6.34 | 5.71 (`swing-25`) | VALID |
+| `cpptrader` | Intrusive AVL + hash | 5.33 | 5.48 | 4.96 | 5.40 | 5.23 | 4.96 (`swing-25`) | VALID |
+| `kautenja` | Unbalanced BST + map | 3.61 | 5.15 | 5.99 | 5.57 | 5.56 | 3.61 (`static`) | VALID |
+| `brprojects` (`br-avl`) | Doubly-linked AVL + `unordered_map` | 5.98 | 0.50 | 0.16 | 0.23 | 0.56 | 0.16 (`swing-25`) | VALID |
+
+### 2. Real Market Replay — NASDAQ TotalView-ITCH 5.0 (`itch_replay_bench`)
 
 Full-day replay of official **`12302019.NASDAQ_ITCH50.gz`** (`268,744,780` wire messages streamed at `8.60 M wire msgs/s`; `5,129,390` normalized L3 `BookEvent`s across `AAPL`, `SPY`, and `MSFT`, verified 100% differentially across `PagedLOB`, `MapStorageBook`, `FastOrderBook`, and `ReferenceOrderBook` at 100 intraday checkpoints + EOD; `taskset -c 0`, `batch=128`, 1 warmup + 5 timed reps):
 
-| Symbol | Book | Full-Day Events | 256-Tick Hot Hit % | Mops/s | p50 (ns) | p99 (ns) | p99.9 (ns) | 6.5h Day Replay |
+| Symbol | Book | Full-Day Events | 256-Tick Near-Touch % | Mops/s | p50 (ns) | p99 (ns) | p99.9 (ns) | 6.5h Day Replay |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **SPY** | **PagedLOB** | 2,249,458 | **91.48%** | **53.26** | **17.5** | **30.2** | **90.4** | **42.2 ms** |
-| SPY | `v1` (flat) | 2,249,458 | — | 42.32 | 23.2 | 40.6 | 103.1 | 53.2 ms |
-| SPY | `std::map` | 2,249,458 | — | 37.27 | 25.0 | 62.5 | 109.5 | 60.4 ms |
-| SPY | `ref_map_list` | 2,249,458 | — | 14.89 | 65.1 | 102.4 | 180.7 | 151.1 ms |
-| **MSFT** | **PagedLOB** | 1,270,785 | **88.28%** | **42.32** | **22.2** | **33.8** | **109.1** | **30.0 ms** |
-| MSFT | `std::map` | 1,270,785 | — | 28.80 | 32.8 | 60.0 | 114.0 | 44.1 ms |
-| MSFT | `v1` (flat) | 1,270,785 | — | 20.15 | 36.2 | 178.2 | 2016.6 | 63.1 ms |
-| **AAPL** | **PagedLOB** | 1,609,147 | **75.08%** | **37.28** | **25.7** | **37.8** | **102.7** | **43.2 ms** |
-| AAPL | `std::map` | 1,609,147 | — | 21.79 | 44.6 | 68.1 | 128.4 | 73.8 ms |
-| AAPL | `ref_map_list` | 1,609,147 | — | 11.27 | 86.9 | 121.5 | 177.1 | 142.7 ms |
-| AAPL | `v1` (flat) | 1,609,147 | — | 7.30 | 122.4 | 338.0 | 2397.4 | 220.6 ms |
+| **SPY** | **PagedLOB v0.5** | 2,249,458 | **91.48%** | **62.67** | **15.1** | **23.1** | **31.6** | **35.9 ms** |
+| SPY | `v1` (flat) | 2,249,458 | — | 42.23 | 23.3 | 40.6 | 95.8 | 53.3 ms |
+| SPY | `std::map` | 2,249,458 | — | 38.47 | 25.0 | 41.5 | 94.9 | 58.5 ms |
+| SPY | `ref_map_list` | 2,249,458 | — | 15.15 | 64.6 | 89.0 | 150.8 | 148.5 ms |
+| **MSFT** | **PagedLOB v0.5** | 1,270,785 | **88.28%** | **52.02** | **18.5** | **26.5** | **57.4** | **24.4 ms** |
+| MSFT | `std::map` | 1,270,785 | — | 29.20 | 33.0 | 55.0 | 112.7 | 43.5 ms |
+| MSFT | `v1` (flat) | 1,270,785 | — | 20.43 | 35.9 | 177.3 | 1981.7 | 62.2 ms |
+| **AAPL** | **PagedLOB v0.5** | 1,609,147 | **75.08%** | **43.95** | **21.9** | **30.6** | **87.9** | **36.6 ms** |
+| AAPL | `std::map` | 1,609,147 | — | 21.99 | 44.2 | 65.9 | 122.3 | 73.2 ms |
+| AAPL | `ref_map_list` | 1,609,147 | — | 11.28 | 86.5 | 126.1 | 186.4 | 142.7 ms |
+| AAPL | `v1` (flat) | 1,609,147 | — | 7.38 | 120.5 | 336.6 | 2406.7 | 218.0 ms |
 
-### PagedLOB vs Public Order Books (`external_compare_bench`)
+### 3. PagedLOB vs Public Order Books (`external_compare_bench`)
 
-`exist`/`churn`/`sweep`/`sparse` are non-crossing; `match_touch` and `match_walk8` cross via `PagedLOB::match_limit` (and each external book's matching `add`). `v1` (`FastOrderBook`) has no matching API. Bold = lowest p50 in row.
+`exist`/`churn`/`sweep`/`sparse` are non-crossing; `match_touch` and `match_walk8` cross via `PagedLOB::match_limit`. Bold = lowest p50 in row.
 
-| Workload | Unit | **PagedLOB v0.3** | v1 (flat) | Liquibook | Tzadiko | br-avl |
+| Workload | Unit | **PagedLOB v0.5** | v1 (flat) | Liquibook | Tzadiko | br-avl |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: |
-| `exist_seq` (16k orders, 8 prices) | ns/call | **20.3** | 24.4 | 88.1 | 77.8 | 22.8 |
-| `exist_shuffle` (16k orders, 8 prices) | ns/call | **20.4** | 23.8 | 108.0 | 79.2 | 23.6 |
-| `churn_1k` (slide best ask, 1k levels) | ns/churn | **62.1** | 1445.7 | 131.9 | 214.9 | 11228.0 |
-| `churn_10k` (slide best ask, 10k levels) | ns/churn | **49.2** | 12904.0 | 148.6 | 235.8 | 107010.9 |
-| `sweep_in_page` (256 adjacent ticks, top-N) | ns/sweep | **137.9** | 194.2 | 388.9 | 461.2 | 4482.9 |
-| `sweep_across` (256-tick stride, top-N) | ns/sweep | 324.6 | **203.1** | 394.4 | 476.2 | 4489.9 |
-| `sparse_jump` (2048 far new-best inserts) | ns/insert | 859.4 | **12.6** | 102.4 | 200.5 | 6067.2 |
-| `match_touch` (cross 1 level + restock) | ns/match | **15.2** | — | 66.3 | 120.4 | 57.8 |
-| `match_walk8` (cross best, restock far) | ns/match | **23.2** | — | 79.8 | 192.8 | 492.0 |
+| `exist_seq` (16k orders, 8 prices) | ns/call | **20.9** | 26.7 | 89.2 | 85.7 | 24.5 |
+| `exist_shuffle` (16k orders, 8 prices) | ns/call | **20.4** | 26.3 | 107.6 | 90.6 | 24.2 |
+| `churn_1k` (slide best ask, 1k levels) | ns/churn | **48.7** | 1507.0 | 138.4 | 215.8 | 10718.0 |
+| `churn_10k` (slide best ask, 10k levels) | ns/churn | **38.5** | 12931.3 | 149.2 | 235.8 | 100568.0 |
+| `sweep_in_page` (256 adjacent ticks, top-N) | ns/sweep | **109.1*** | 203.6 | 394.4 | 489.5 | 4694.8 |
+| `sweep_across` (256-tick stride, top-N) | ns/sweep | 470.2* | **203.5** | 383.4 | 484.8 | 4693.3 |
+| `sparse_jump` (2048 far new-best inserts) | ns/insert | 252.0 | **13.2** | 118.7 | 194.1 | 5622.5 |
+| `match_touch` (cross 1 level + restock) | ns/match | **23.6** | — | 68.3 | 124.3 | 54.0 |
+| `match_walk8` (cross best, restock far) | ns/match | **21.1** | — | 79.9 | 182.3 | 466.9 |
 
-Selected throughput and `mallinfo2` heap deltas from the same run:
+*\*Pure `price_index_bench` `sweep_in_page` = **109.1 ns** (`9.03 Mops/s`); `external_compare_bench` wraps snapshots into generic vectors (`291.8 ns` vs `394.4 ns` Liquibook).*
 
-- `exist_seq`: **48.46 Mops/s**, 1.46 MB heap (vs br-avl 22.8 ns, 1.48 MB)
-- `churn_10k`: **20.00 Mops/s**, 1.71 MB heap (vs Liquibook 148.6 ns / br-avl 107.0 µs)
-- `match_touch`: **49.62 Mops/s**, 15.2 ns p50 (3.80× faster than br-avl, 4.36× faster than Liquibook)
-- `match_walk8`: **41.44 Mops/s**, 23.2 ns p50 (3.44× faster than Liquibook, 21.2× faster than br-avl)
+### 4. Structural Memory (`price_index_bench`)
 
-### Structural Memory (`price_index_bench`)
-
-| Workload | PagedLOB price bytes | PagedLOB total | `std::map` total | v1 price bytes | v1 total |
+| Workload | PagedLOB v0.5 price bytes | PagedLOB total | `std::map` total | v1 price bytes | v1 total |
 | :--- | ---: | ---: | ---: | ---: | ---: |
-| `exist_seq` | 6,320 B | 1.45 MB | 1.44 MB | 2,048 B | 1.45 MB |
-| `churn_10k` | 63,104 B | 1.55 MB | 1.96 MB | 1.05 MB | 2.69 MB |
-| `sparse_jump` | 11.16 MB | 11.42 MB | 360.5 KB | 131 KB | 426 KB |
-
-### Page-Width Sweep (`page_param_sweep`)
-
-Compile-time leaf width `PagedStorageBookT<PageBits>` with the 256-tick hot window enabled (p50):
-
-| ticks | leaf | `exist_seq` | `churn_10k` | `walk_dense` | `walk_1_per_page` | `sparse_jump` |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 32 | 184 B | 22.6 ns | 47.9 ns | 114.9 ns | 172.6 ns | 1118.2 ns |
-| 64 | 312 B | 20.3 ns | **44.2 ns** | **106.4 ns** | **169.4 ns** | **996.3 ns** |
-| 128 | 576 B | 20.0 ns | 46.2 ns | **106.4 ns** | 226.9 ns | 1040.4 ns |
-| **256 (default)** | 1104 B | 20.1 ns | 47.5 ns | 106.6 ns | 375.6 ns | 1160.4 ns |
-| 512 | 2160 B | 20.2 ns | 48.3 ns | 107.2 ns | 490.6 ns | 1417.9 ns |
-| 1024 | 4272 B | **19.3 ns** | 48.6 ns | **106.4 ns** | 706.2 ns | 1868.1 ns |
+| `exist_seq` | 8,624 B | 1.45 MB | 1.44 MB | 2,048 B | 1.45 MB |
+| `churn_10k` | **64,304 B** | **1.63 MB** | 2.04 MB | 1.05 MB | 2.69 MB |
+| `sparse_jump` | **2.54 MB** (down `4.4×` from `11.16 MB`) | **2.82 MB** | 376.9 KB | 131 KB | 426 KB |
 
 ## Layout
 
 ```text
-include/fastlob/   # PagedLOB (paged_price_index, storage_book, level_pool, price_key), pools, Order, ExecutionSimulator, reference & v1 baseline
-src/               # ScopedAllocProbe (optional global new counter)
-tests/             # unit, differential, matching, hot/cold, page-width, zero-alloc, external agreement
-bench/             # external_compare_bench, price_index_bench, page_param_sweep, gbench, latency_hist
-docs/              # pagedlob-architecture.md (Chinese design notes, benchmarks, review closure & version changelog)
-python/            # pybind11 module + demo (binds PagedLOB + ExecutionSimulator)
-.github/workflows/ # CI (Release + ScopedAllocProbe, ASan+UBSan)
+include/fastlob/                    # PagedLOB (paged_price_index, storage_book, level_pool, price_key, itch50), pools, Order, ExecutionSimulator
+adapters/matching_engine_benchmark/ # Zero-shadow C ABI adapter + build.sh for flash1-dev/matching-engine-benchmark
+src/                                # ScopedAllocProbe (optional global new counter)
+tests/                              # 65 unit, differential, matching, IOC/callback, zero-migration spike, ITCH 5.0 & external tests
+bench/                              # external_compare_bench, price_index_bench, page_param_sweep, itch_replay_bench, perf_counters
+docs/                               # pagedlob-architecture.md (Chinese design notes, benchmarks, review closure & version changelog)
+python/                             # pybind11 module + demo (binds PagedLOB + ExecutionSimulator)
+.github/workflows/                  # CI (Release + ScopedAllocProbe, ASan+UBSan)
 ```
 
 ## Limitations
 
 - Single-threaded, single-instrument per book instance, in-memory only
 - No self-trade prevention (STP) or hidden/iceberg orders
-- `modify` supports qty decrease only (price change = cancel + add, matching ITCH 5.0 `'X'` vs `'U'`)
-- Pathological 64-bit sparse far-from-touch jumps (`sparse_jump`) still allocate uncompressed 7-level radix nodes (see [docs/pagedlob-architecture.md](docs/pagedlob-architecture.md) §5 & §8)
+- `apply()`/`modify()` supports qty decrease in-place; price/qty-up replacement uses `cancel` + `add` (matching ITCH 5.0 `'X'` vs `'U'` and `matching-engine-benchmark` `engine_on_modify`)

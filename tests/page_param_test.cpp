@@ -11,35 +11,16 @@
 namespace {
 
 template <int PageBits>
-std::size_t cold_leaves_at(const std::vector<fastlob::Price>& bids, const std::vector<fastlob::Price>& asks) {
-    constexpr int kHot = fastlob::PagedPriceIndex<PageBits>::kHotTicks;
-    auto count = [](fastlob::Side side, const std::vector<fastlob::Price>& prices) {
-        if (prices.empty()) {
-            return std::size_t{0};
-        }
-        fastlob::Price best = prices.front();
-        for (fastlob::Price price : prices) {
-            if (side == fastlob::Side::Buy ? price > best : price < best) {
-                best = price;
-            }
-        }
+std::size_t active_leaves_at(const std::vector<fastlob::Price>& bids,
+                             const std::vector<fastlob::Price>& asks) {
+    auto count = [](const std::vector<fastlob::Price>& prices) {
         std::set<std::uint64_t> pages;
         for (fastlob::Price price : prices) {
-            const bool hot =
-                side == fastlob::Side::Sell
-                    ? (price >= best && static_cast<std::uint64_t>(price) -
-                                                static_cast<std::uint64_t>(best) <
-                                            static_cast<std::uint64_t>(kHot))
-                    : (price <= best && static_cast<std::uint64_t>(best) -
-                                                static_cast<std::uint64_t>(price) <
-                                            static_cast<std::uint64_t>(kHot));
-            if (!hot) {
-                pages.insert(fastlob::tick_page_key<PageBits>(price));
-            }
+            pages.insert(fastlob::tick_page_key<PageBits>(price));
         }
         return pages.size();
     };
-    return count(fastlob::Side::Buy, bids) + count(fastlob::Side::Sell, asks);
+    return count(bids) + count(asks);
 }
 
 template <int PageBits>
@@ -94,7 +75,7 @@ void check_page_width() {
         sells.push_back(i);
         buys.push_back(-1 - i);
     }
-    EXPECT_EQ(paged.page_stats().live_leaves, cold_leaves_at<PageBits>(buys, sells));
+    EXPECT_EQ(paged.page_stats().live_leaves, active_leaves_at<PageBits>(buys, sells));
 
     std::vector<fastlob::LevelView> ref_out(static_cast<std::size_t>(kLevels));
     std::vector<fastlob::LevelView> paged_out(static_cast<std::size_t>(kLevels));
@@ -118,7 +99,7 @@ void check_page_width() {
         cancel(static_cast<fastlob::OrderId>(i + 1));
     }
     sells.erase(sells.begin(), sells.begin() + kTicks);
-    EXPECT_EQ(paged.page_stats().live_leaves, cold_leaves_at<PageBits>(buys, sells));
+    EXPECT_EQ(paged.page_stats().live_leaves, active_leaves_at<PageBits>(buys, sells));
     EXPECT_EQ(paged.top_n(fastlob::Side::Sell, paged_out),
               reference.top_n(fastlob::Side::Sell, ref_out));
     EXPECT_EQ(paged_out[0].price, kTicks);

@@ -17,7 +17,7 @@
 namespace fastlob {
 
 /// Occupancy-bitmap helpers using portable C++20 `<bit>` intrinsics.
-/// Words is deduced from the array bound: 4 for an 8-bit radix node, (ticks / 64) for a leaf/ring.
+/// Words is deduced from the array bound: 4 for an 8-bit radix node, (ticks / 64) for a leaf.
 template <int Words>
 inline void occ_set(std::uint64_t (&occ)[Words], int bit) {
     occ[bit >> 6] |= std::uint64_t{1} << (bit & 63);
@@ -40,6 +40,24 @@ inline bool occ_any(const std::uint64_t (&occ)[Words]) {
         u |= occ[word];
     }
     return u != 0;
+}
+
+/// Returns the sole set bit index if popcount(occ) == 1, otherwise -1.
+template <int Words>
+inline int occ_single_bit(const std::uint64_t (&occ)[Words]) {
+    int found_word = -1;
+    for (int word = 0; word < Words; ++word) {
+        if (occ[word] != 0) {
+            if (found_word >= 0 || (occ[word] & (occ[word] - 1)) != 0) {
+                return -1;
+            }
+            found_word = word;
+        }
+    }
+    if (found_word < 0) {
+        return -1;
+    }
+    return (found_word << 6) + std::countr_zero(occ[found_word]);
 }
 
 template <int Words>
@@ -137,22 +155,25 @@ inline PageStats operator+(PageStats lhs, const PageStats& rhs) {
     return lhs;
 }
 
-/// Eight-bit radix over the high (64 - PageBits) of the encoded tick, plus a
-/// 2^PageBits-tick leaf. The nearest HotTicks ticks from best live in a dense
-/// ring with an occupancy bitmap (hot); everything worse stays in the radix
-/// (cold) with an intrusive sorted leaf list. Each level sits in exactly one tier.
+/// Zero-migration unified paged radix price directory (`v0.5.0`):
+/// - Every active `BookLevel` resides permanently in its aligned `2^PageBits`-tick `Leaf`
+///   from creation until depleted, eliminating hot-cold level migration under wide spikes.
+/// - `BookLevel::owner_page` enables strict O(1) `close(level)` with zero radix walk.
+/// - Three-tier cache (`best_leaf_` + MRU `hot_leaf_` + `near_dir_` covering 256 adjacent
+///   leaves = 65,536 ticks at default PageBits=8) resolves near-touch and wide-volatility
+///   operations in O(1) without traversing upper radix levels.
+/// - Tagged single-leaf path compression (`uintptr_t | 1`) avoids intermediate `DirNode`
+///   chains on sparse subtrees and collapses back automatically on empty.
 template <int PageBits = kDefaultPageBits, int HotTicks = 256>
 class PagedPriceIndex {
 public:
     static_assert(PageBits >= 5 && PageBits <= 12, "page width must fit a compact occupancy word set");
     static_assert(HotTicks >= 64 && HotTicks <= 1024 && (HotTicks & (HotTicks - 1)) == 0,
-                  "hot window is a power-of-two ring");
+                  "hot window parameter kept for template compatibility");
 
     static constexpr int kPageBits = PageBits;
     static constexpr int kTicks = 1 << PageBits;
     static constexpr int kHotTicks = HotTicks;
-    static constexpr int kHotMask = HotTicks - 1;
-    static constexpr int kHotOccWords = HotTicks / 64;
     static constexpr int kOccWords = (kTicks + 63) / 64;
     static constexpr int kKeyBits = 64 - PageBits;
     static constexpr int kDigitBits = 8;
@@ -180,14 +201,19 @@ public:
         std::uint32_t handle[kTicks]{};
     };
 
+    static_assert(alignof(DirNode) >= 2 && alignof(Leaf) >= 2,
+                  "low pointer bit is reserved for single-leaf path compression");
+
     PagedPriceIndex(LevelPool& pool, Side side) : pool_(&pool), side_(side) {
         root_ = create_node(0);
+        // Pre-warm 2 leaves on the free list so near-touch operations start zero-alloc out of the box.
+        reserve(1, 2);
     }
 
     PagedPriceIndex(const PagedPriceIndex&) = delete;
     PagedPriceIndex& operator=(const PagedPriceIndex&) = delete;
 
-    /// Pre-allocate cold radix directory nodes and leaves onto internal free lists.
+    /// Pre-allocate radix directory nodes and leaves onto internal free lists.
     void reserve(std::size_t nodes, std::size_t leaves) {
         while (created_nodes_ < nodes) {
             auto owned = std::make_unique<DirNode>();
@@ -211,45 +237,23 @@ public:
         if (best_ == nullptr) {
             return nullptr;
         }
-        const int off = offset_from(hot_origin_, price);
-        if (off >= 0) {
-            const std::uint32_t handle = hot_handle_[hot_index(off)];
-            return handle == 0 ? nullptr : pool_->get(handle);
+        const Leaf* leaf = find_leaf(tick_page_key<PageBits>(price));
+        if (leaf == nullptr) {
+            return nullptr;
         }
-        return live_leaves_ == 0 ? nullptr : radix_find(price);
+        const std::uint32_t handle = leaf->handle[tick_page_slot<PageBits>(price)];
+        return handle == 0 ? nullptr : pool_->get(handle);
     }
 
     /// Single-pass lookup + level creation for `StorageBook::add`.
     /// Never mutates directory state if `LevelPool` is exhausted.
     [[nodiscard]] BookLevel* find_or_open(Price price) {
-        if (best_ == nullptr) {
-            BookLevel* level = pool_->acquire(price, side_);
-            if (level == nullptr) {
-                return nullptr;
-            }
-            assert(hot_count_ == 0);
-            hot_base_ = 0;
-            hot_origin_ = price;
-            hot_put_at_idx(0, pool_->handle_of(level));
-            best_ = level;
-            ++active_;
-            return level;
-        }
-        if (is_better(price, best_->price)) {
-            BookLevel* level = pool_->acquire(price, side_);
-            if (level == nullptr) {
-                return nullptr;
-            }
-            promote_better_origin(price);
-            hot_put_at_idx(hot_index(0), pool_->handle_of(level));
-            best_ = level;
-            ++active_;
-            return level;
-        }
-        const int off = offset_from(hot_origin_, price);
-        if (off >= 0) {
-            const int idx = hot_index(off);
-            const std::uint32_t existing = hot_handle_[idx];
+        const std::uint64_t page_key = tick_page_key<PageBits>(price);
+        const int slot = tick_page_slot<PageBits>(price);
+
+        // Tier 0a: `best_leaf_` (aligned 2^PageBits neighborhood of `best_`)
+        if (best_leaf_ != nullptr && best_leaf_->page_key == page_key) {
+            const std::uint32_t existing = best_leaf_->handle[slot];
             if (existing != 0) {
                 return pool_->get(existing);
             }
@@ -257,30 +261,69 @@ public:
             if (level == nullptr) {
                 return nullptr;
             }
-            hot_put_at_idx(idx, pool_->handle_of(level));
+            level->owner_page = best_leaf_;
+            occ_set(best_leaf_->occ, slot);
+            best_leaf_->handle[slot] = pool_->handle_of(level);
+            if (is_better(price, best_->price)) {
+                best_ = level;
+            }
             ++active_;
             return level;
         }
-        const std::uint64_t page_key = tick_page_key<PageBits>(price);
-        const int slot = tick_page_slot<PageBits>(price);
-        if (!pool_->has_free()) {
-            if (live_leaves_ == 0) {
+
+        // Tier 0b: MRU `hot_leaf_` (eliminates page-boundary straddle overhead)
+        if (hot_leaf_ != nullptr && hot_leaf_->page_key == page_key) {
+            const std::uint32_t existing = hot_leaf_->handle[slot];
+            if (existing != 0) {
+                return pool_->get(existing);
+            }
+            BookLevel* level = pool_->acquire(price, side_);
+            if (level == nullptr) {
                 return nullptr;
             }
+            level->owner_page = hot_leaf_;
+            occ_set(hot_leaf_->occ, slot);
+            hot_leaf_->handle[slot] = pool_->handle_of(level);
+            if (best_ == nullptr || is_better(price, best_->price)) {
+                best_ = level;
+                best_leaf_ = hot_leaf_;
+            }
+            ++active_;
+            return level;
+        }
+
+        if (!pool_->has_free()) {
             const Leaf* leaf = find_leaf(page_key);
-            if (leaf == nullptr || !occ_test(leaf->occ, slot)) {
+            if (leaf == nullptr || leaf->handle[slot] == 0) {
                 return nullptr;
             }
             return pool_->get(leaf->handle[slot]);
         }
+
         Leaf* leaf = ensure_leaf(page_key);
-        if (occ_test(leaf->occ, slot)) {
-            return pool_->get(leaf->handle[slot]);
+        const std::uint32_t existing = leaf->handle[slot];
+        if (existing != 0) {
+            hot_leaf_ = leaf;
+            return pool_->get(existing);
         }
         BookLevel* level = pool_->acquire(price, side_);
         assert(level != nullptr);
+        level->owner_page = leaf;
         occ_set(leaf->occ, slot);
         leaf->handle[slot] = pool_->handle_of(level);
+        if (best_ == nullptr || is_better(price, best_->price)) {
+            if (best_leaf_ != nullptr && best_leaf_ != leaf) {
+                hot_leaf_ = best_leaf_;
+            }
+            best_ = level;
+            best_leaf_ = leaf;
+            if (leaf->parent->depth == kLastDirDepth) {
+                near_dir_ = leaf->parent;
+                near_dir_prefix_ = page_key >> kDigitBits;
+            }
+        } else {
+            hot_leaf_ = leaf;
+        }
         ++active_;
         return level;
     }
@@ -292,48 +335,57 @@ public:
 
     void close(BookLevel* level) {
         assert(level->head == nullptr && level->tail == nullptr);
+        Leaf* leaf = static_cast<Leaf*>(level->owner_page);
+        assert(leaf != nullptr);
+        const int slot = tick_page_slot<PageBits>(level->price);
+        assert(occ_test(leaf->occ, slot) && leaf->handle[slot] == pool_->handle_of(level));
+        occ_clear(leaf->occ, slot);
+        leaf->handle[slot] = 0;
+
         if (best_ == level) {
-            const std::uint32_t removed = hot_take_at_idx(hot_index(0));
-            assert(removed == pool_->handle_of(level));
-            (void)removed;
-            pool_->release(level);
-            assert(active_ > 0);
-            --active_;
-            if (hot_count_ > 0) {
-                int next_idx = occ_at_or_above(hot_occ_, hot_base_);
-                if (next_idx < 0) {
-                    next_idx = occ_lowest(hot_occ_);
-                }
-                assert(next_idx >= 0);
-                BookLevel* next = pool_->get(hot_handle_[next_idx]);
-                hot_base_ = next_idx;
-                hot_origin_ = next->price;
-                best_ = next;
-                if (live_leaves_ > 0) {
-                    steal_cold_into_hot();
+            if (side_ == Side::Sell) {
+                const int next_slot = occ_above(leaf->occ, slot);
+                if (next_slot >= 0) {
+                    best_ = pool_->get(leaf->handle[next_slot]);
+                } else {
+                    Leaf* next_leaf = leaf->next_leaf;
+                    release_leaf(leaf);
+                    if (next_leaf == nullptr) {
+                        best_ = nullptr;
+                        best_leaf_ = nullptr;
+                    } else {
+                        best_leaf_ = next_leaf;
+                        best_ = pool_->get(next_leaf->handle[occ_lowest(next_leaf->occ)]);
+                        if (next_leaf->parent->depth == kLastDirDepth) {
+                            near_dir_ = next_leaf->parent;
+                            near_dir_prefix_ = next_leaf->page_key >> kDigitBits;
+                        }
+                    }
                 }
             } else {
-                hot_base_ = 0;
-                if (live_leaves_ == 0) {
-                    best_ = nullptr;
+                const int prev_slot = occ_below(leaf->occ, slot);
+                if (prev_slot >= 0) {
+                    best_ = pool_->get(leaf->handle[prev_slot]);
                 } else {
-                    BookLevel* cold = compute_best_cold();
-                    assert(cold != nullptr);
-                    hot_origin_ = cold->price;
-                    best_ = cold;
-                    steal_cold_into_hot();
+                    Leaf* prev_leaf = leaf->prev_leaf;
+                    release_leaf(leaf);
+                    if (prev_leaf == nullptr) {
+                        best_ = nullptr;
+                        best_leaf_ = nullptr;
+                    } else {
+                        best_leaf_ = prev_leaf;
+                        best_ = pool_->get(prev_leaf->handle[occ_highest(prev_leaf->occ)]);
+                        if (prev_leaf->parent->depth == kLastDirDepth) {
+                            near_dir_ = prev_leaf->parent;
+                            near_dir_prefix_ = prev_leaf->page_key >> kDigitBits;
+                        }
+                    }
                 }
             }
-            return;
+        } else if (!occ_any(leaf->occ)) {
+            release_leaf(leaf);
         }
-        const int off = hot_offset(level->price);
-        if (off >= 0) {
-            const std::uint32_t removed = hot_take_at_idx(hot_index(off));
-            assert(removed == pool_->handle_of(level));
-            (void)removed;
-        } else {
-            radix_remove(level);
-        }
+
         pool_->release(level);
         assert(active_ > 0);
         --active_;
@@ -344,64 +396,35 @@ public:
             return 0;
         }
         std::size_t n = 0;
-        if (hot_count_ > 0) {
-            const int start_word = hot_base_ >> 6;
-            for (int w_idx = start_word; w_idx < kHotOccWords && n < out.size(); ++w_idx) {
-                std::uint64_t w = hot_occ_[w_idx];
-                if (w_idx == start_word) {
-                    w &= (~0ULL << (hot_base_ & 63));
-                }
-                while (w != 0 && n < out.size()) {
-                    const int bit = std::countr_zero(w);
-                    out[n++] = view_of(hot_handle_[(w_idx << 6) | bit]);
-                    w &= (w - 1);
-                }
-            }
-            if (hot_base_ > 0 && n < out.size()) {
-                const int stop_word = hot_base_ >> 6;
-                for (int w_idx = 0; w_idx < stop_word && n < out.size(); ++w_idx) {
-                    std::uint64_t w = hot_occ_[w_idx];
-                    while (w != 0 && n < out.size()) {
-                        const int bit = std::countr_zero(w);
-                        out[n++] = view_of(hot_handle_[(w_idx << 6) | bit]);
-                        w &= (w - 1);
-                    }
-                }
-                const int rem_bits = hot_base_ & 63;
-                if (rem_bits != 0 && n < out.size()) {
-                    std::uint64_t w = hot_occ_[stop_word] & ((1ULL << rem_bits) - 1);
-                    while (w != 0 && n < out.size()) {
-                        const int bit = std::countr_zero(w);
-                        out[n++] = view_of(hot_handle_[(stop_word << 6) | bit]);
-                        w &= (w - 1);
-                    }
-                }
-            }
-        }
-        if (n >= out.size() || live_leaves_ == 0) {
-            return n;
-        }
         if (side_ == Side::Sell) {
             for (const Leaf* leaf = min_leaf_; leaf != nullptr && n < out.size();
                  leaf = leaf->next_leaf) {
-                for (int bit = occ_lowest(leaf->occ); bit >= 0 && n < out.size();
-                     bit = occ_above(leaf->occ, bit)) {
-                    out[n++] = view_of(leaf->handle[bit]);
+                for (int w_idx = 0; w_idx < kOccWords && n < out.size(); ++w_idx) {
+                    std::uint64_t w = leaf->occ[w_idx];
+                    while (w != 0 && n < out.size()) {
+                        const int bit = std::countr_zero(w);
+                        out[n++] = view_of(leaf->handle[(w_idx << 6) | bit]);
+                        w &= (w - 1);
+                    }
                 }
             }
         } else {
             for (const Leaf* leaf = max_leaf_; leaf != nullptr && n < out.size();
                  leaf = leaf->prev_leaf) {
-                for (int bit = occ_highest(leaf->occ); bit >= 0 && n < out.size();
-                     bit = occ_below(leaf->occ, bit)) {
-                    out[n++] = view_of(leaf->handle[bit]);
+                for (int w_idx = kOccWords - 1; w_idx >= 0 && n < out.size(); --w_idx) {
+                    std::uint64_t w = leaf->occ[w_idx];
+                    while (w != 0 && n < out.size()) {
+                        const int bit = 63 - std::countl_zero(w);
+                        out[n++] = view_of(leaf->handle[(w_idx << 6) | bit]);
+                        w ^= (std::uint64_t{1} << bit);
+                    }
                 }
             }
         }
         return n;
     }
 
-    /// Committed directory memory, including recycled nodes kept on the free list.
+    /// Committed directory memory, including recycled nodes/leaves kept on the free list.
     [[nodiscard]] std::size_t bytes() const { return committed_bytes(); }
     [[nodiscard]] std::size_t live_bytes() const { return stats().live_bytes; }
     [[nodiscard]] std::size_t peak_bytes() const { return committed_bytes(); }
@@ -414,7 +437,7 @@ public:
         s.committed_leaves = created_leaves_;
         s.live_leaves = live_leaves_;
         s.committed_bytes = committed_bytes();
-        s.live_bytes = live_nodes_ * sizeof(DirNode) + live_leaves_ * sizeof(Leaf) + hot_bytes();
+        s.live_bytes = live_nodes_ * sizeof(DirNode) + live_leaves_ * sizeof(Leaf);
         return s;
     }
 
@@ -422,6 +445,18 @@ public:
     [[nodiscard]] static std::size_t leaf_bytes() { return sizeof(Leaf); }
 
 private:
+    static void* tag_leaf(Leaf* leaf) {
+        return reinterpret_cast<void*>(reinterpret_cast<std::uintptr_t>(leaf) | std::uintptr_t{1});
+    }
+
+    static bool is_tagged_leaf(const void* ptr) {
+        return (reinterpret_cast<std::uintptr_t>(ptr) & std::uintptr_t{1}) != 0;
+    }
+
+    static Leaf* untag_leaf(void* ptr) {
+        return reinterpret_cast<Leaf*>(reinterpret_cast<std::uintptr_t>(ptr) & ~std::uintptr_t{1});
+    }
+
     static std::uint8_t digit_of(std::uint64_t page_key, int depth) {
         return static_cast<std::uint8_t>((page_key >> ((kLastDirDepth - depth) * kDigitBits)) & 0xFF);
     }
@@ -435,178 +470,8 @@ private:
         return LevelView{level->price, level->total_qty};
     }
 
-    [[nodiscard]] static std::size_t hot_bytes() {
-        return sizeof(std::uint32_t) * static_cast<std::size_t>(kHotTicks) +
-               sizeof(std::uint64_t) * static_cast<std::size_t>(kHotOccWords);
-    }
-
-    [[nodiscard]] int hot_index(int offset) const { return (hot_base_ + offset) & kHotMask; }
-
-    void hot_put_at_idx(int idx, std::uint32_t handle) {
-        assert(handle != 0 && hot_handle_[idx] == 0 && !occ_test(hot_occ_, idx));
-        hot_handle_[idx] = handle;
-        occ_set(hot_occ_, idx);
-        ++hot_count_;
-    }
-
-    std::uint32_t hot_take_at_idx(int idx) {
-        const std::uint32_t handle = hot_handle_[idx];
-        if (handle != 0) {
-            hot_handle_[idx] = 0;
-            occ_clear(hot_occ_, idx);
-            assert(hot_count_ > 0);
-            --hot_count_;
-        }
-        return handle;
-    }
-
     [[nodiscard]] std::size_t committed_bytes() const {
-        return created_nodes_ * sizeof(DirNode) + created_leaves_ * sizeof(Leaf) + hot_bytes();
-    }
-
-    [[nodiscard]] int hot_offset(Price price) const {
-        if (best_ == nullptr) {
-            return -1;
-        }
-        return offset_from(hot_origin_, price);
-    }
-
-    [[nodiscard]] int offset_from(Price origin, Price price) const {
-        if (side_ == Side::Sell) {
-            if (price < origin) {
-                return -1;
-            }
-            const std::uint64_t delta = static_cast<std::uint64_t>(price) - static_cast<std::uint64_t>(origin);
-            if (delta >= static_cast<std::uint64_t>(kHotTicks)) {
-                return -1;
-            }
-            return static_cast<int>(delta);
-        }
-        if (price > origin) {
-            return -1;
-        }
-        const std::uint64_t delta = static_cast<std::uint64_t>(origin) - static_cast<std::uint64_t>(price);
-        if (delta >= static_cast<std::uint64_t>(kHotTicks)) {
-            return -1;
-        }
-        return static_cast<int>(delta);
-    }
-
-    [[nodiscard]] int improvement_delta(Price old_origin, Price better_origin) const {
-        const std::uint64_t delta = side_ == Side::Sell
-                                        ? static_cast<std::uint64_t>(old_origin) -
-                                              static_cast<std::uint64_t>(better_origin)
-                                        : static_cast<std::uint64_t>(better_origin) -
-                                              static_cast<std::uint64_t>(old_origin);
-        return delta >= static_cast<std::uint64_t>(kHotTicks) ? kHotTicks : static_cast<int>(delta);
-    }
-
-    /// Shift or reset the hot window when a strictly better price arrives.
-    /// Cold levels are all worse than `old_origin + kHotTicks`, so none can enter `[new_origin, +kHotTicks)`.
-    void promote_better_origin(Price new_origin) {
-        const int d = improvement_delta(hot_origin_, new_origin);
-        assert(d >= 1 && d <= kHotTicks);
-        if (d == 1) {
-            const std::uint32_t h = hot_take_at_idx(hot_index(kHotTicks - 1));
-            if (h != 0) {
-                radix_put(pool_->get(h));
-            }
-            hot_base_ = (hot_base_ - 1) & kHotMask;
-            hot_origin_ = new_origin;
-            return;
-        }
-        if (static_cast<std::size_t>(d) < hot_count_) {
-            for (int off = kHotTicks - d; off < kHotTicks; ++off) {
-                const std::uint32_t h = hot_take_at_idx(hot_index(off));
-                if (h != 0) {
-                    radix_put(pool_->get(h));
-                }
-            }
-        } else {
-            for (int idx = occ_lowest(hot_occ_); idx >= 0; idx = occ_above(hot_occ_, idx)) {
-                const int off = (idx - hot_base_) & kHotMask;
-                if (off >= kHotTicks - d) {
-                    const std::uint32_t h = hot_take_at_idx(idx);
-                    radix_put(pool_->get(h));
-                }
-            }
-        }
-        hot_base_ = (hot_count_ == 0) ? 0 : ((hot_base_ - d) & kHotMask);
-        hot_origin_ = new_origin;
-    }
-
-    /// Pull cold levels that now fall within `< kHotTicks` of `hot_origin_` using the sorted leaf list.
-    void steal_cold_into_hot() {
-        if (side_ == Side::Sell) {
-            while (min_leaf_ != nullptr) {
-                const int slot = occ_lowest(min_leaf_->occ);
-                assert(slot >= 0);
-                const std::uint32_t handle = min_leaf_->handle[slot];
-                BookLevel* level = pool_->get(handle);
-                const int off = offset_from(hot_origin_, level->price);
-                if (off < 0) {
-                    return;
-                }
-                occ_clear(min_leaf_->occ, slot);
-                min_leaf_->handle[slot] = 0;
-                if (!occ_any(min_leaf_->occ)) {
-                    release_leaf(min_leaf_);
-                }
-                hot_put_at_idx(hot_index(off), handle);
-            }
-            return;
-        }
-        while (max_leaf_ != nullptr) {
-            const int slot = occ_highest(max_leaf_->occ);
-            assert(slot >= 0);
-            const std::uint32_t handle = max_leaf_->handle[slot];
-            BookLevel* level = pool_->get(handle);
-            const int off = offset_from(hot_origin_, level->price);
-            if (off < 0) {
-                return;
-            }
-            occ_clear(max_leaf_->occ, slot);
-            max_leaf_->handle[slot] = 0;
-            if (!occ_any(max_leaf_->occ)) {
-                release_leaf(max_leaf_);
-            }
-            hot_put_at_idx(hot_index(off), handle);
-        }
-    }
-
-    [[nodiscard]] BookLevel* radix_find(Price price) const {
-        const Leaf* leaf = find_leaf(tick_page_key<PageBits>(price));
-        if (leaf == nullptr) {
-            return nullptr;
-        }
-        const int slot = tick_page_slot<PageBits>(price);
-        if (!occ_test(leaf->occ, slot)) {
-            return nullptr;
-        }
-        return pool_->get(leaf->handle[slot]);
-    }
-
-    void radix_put(BookLevel* level) {
-        Leaf* leaf = ensure_leaf(tick_page_key<PageBits>(level->price));
-        const int slot = tick_page_slot<PageBits>(level->price);
-        assert(!occ_test(leaf->occ, slot));
-        occ_set(leaf->occ, slot);
-        leaf->handle[slot] = pool_->handle_of(level);
-    }
-
-    void radix_remove(BookLevel* level) {
-        Leaf* leaf = find_leaf(tick_page_key<PageBits>(level->price));
-        if (leaf == nullptr) {
-            assert(false && "cold leaf missing on radix_remove");
-            return;
-        }
-        const int slot = tick_page_slot<PageBits>(level->price);
-        assert(occ_test(leaf->occ, slot));
-        occ_clear(leaf->occ, slot);
-        leaf->handle[slot] = 0;
-        if (!occ_any(leaf->occ)) {
-            release_leaf(leaf);
-        }
+        return created_nodes_ * sizeof(DirNode) + created_leaves_ * sizeof(Leaf);
     }
 
     DirNode* create_node(std::uint8_t depth) {
@@ -716,29 +581,49 @@ private:
         if (min_leaf_ == nullptr) {
             return nullptr;
         }
+        if (best_leaf_ != nullptr && best_leaf_->page_key == page_key) {
+            return best_leaf_;
+        }
+        if (hot_leaf_ != nullptr && hot_leaf_->page_key == page_key) {
+            return hot_leaf_;
+        }
         if (min_leaf_->page_key == page_key) {
             return min_leaf_;
         }
         if (max_leaf_->page_key == page_key) {
             return max_leaf_;
         }
+        if (near_dir_ != nullptr && (page_key >> kDigitBits) == near_dir_prefix_) {
+            void* p = near_dir_->child[page_key & 0xFF];
+            return p == nullptr ? nullptr : untag_leaf(p);
+        }
         const DirNode* node = root_;
-        for (int depth = 0; depth < kLastDirDepth; ++depth) {
-            const std::uint8_t digit = digit_of(page_key, depth);
-            if (!occ_test(node->occ, digit)) {
+        for (int depth = 0; depth <= kLastDirDepth; ++depth) {
+            void* p = node->child[digit_of(page_key, depth)];
+            if (p == nullptr) {
                 return nullptr;
             }
-            node = static_cast<const DirNode*>(node->child[digit]);
+            if (is_tagged_leaf(p)) {
+                Leaf* leaf = untag_leaf(p);
+                if (leaf->page_key == page_key) {
+                    hot_leaf_ = leaf;
+                    return leaf;
+                }
+                return nullptr;
+            }
+            node = static_cast<const DirNode*>(p);
         }
-        const std::uint8_t last = digit_of(page_key, kLastDirDepth);
-        if (!occ_test(node->occ, last)) {
-            return nullptr;
-        }
-        return static_cast<Leaf*>(node->child[last]);
+        return nullptr;
     }
 
     Leaf* ensure_leaf(std::uint64_t page_key) {
         if (min_leaf_ != nullptr) {
+            if (best_leaf_ != nullptr && best_leaf_->page_key == page_key) {
+                return best_leaf_;
+            }
+            if (hot_leaf_ != nullptr && hot_leaf_->page_key == page_key) {
+                return hot_leaf_;
+            }
             if (min_leaf_->page_key == page_key) {
                 return min_leaf_;
             }
@@ -746,39 +631,109 @@ private:
                 return max_leaf_;
             }
         }
-        DirNode* node = root_;
-        for (int depth = 0; depth < kLastDirDepth; ++depth) {
-            const std::uint8_t digit = digit_of(page_key, depth);
-            if (node->child[digit] == nullptr) {
-                DirNode* child = create_node(static_cast<std::uint8_t>(node->depth + 1));
-                child->parent = node;
-                child->parent_digit = digit;
-                node->child[digit] = child;
-                occ_set(node->occ, digit);
+        // Tier 1: cached `depth == kLastDirDepth` directory node covering 256 adjacent pages
+        if (near_dir_ != nullptr && (page_key >> kDigitBits) == near_dir_prefix_) {
+            const auto last = static_cast<std::uint8_t>(page_key & 0xFF);
+            void* p = near_dir_->child[last];
+            if (p != nullptr) {
+                return untag_leaf(p);
             }
-            node = static_cast<DirNode*>(node->child[digit]);
-        }
-        const std::uint8_t last = digit_of(page_key, kLastDirDepth);
-        if (node->child[last] == nullptr) {
             Leaf* leaf = create_leaf();
             leaf->page_key = page_key;
-            leaf->parent = node;
+            leaf->parent = near_dir_;
             leaf->parent_digit = last;
-            node->child[last] = leaf;
-            occ_set(node->occ, last);
+            near_dir_->child[last] = tag_leaf(leaf);
+            occ_set(near_dir_->occ, last);
             link_new_leaf(leaf);
+            return leaf;
         }
-        return static_cast<Leaf*>(node->child[last]);
+
+        // Tier 2: path-compressed radix walk & lazy split
+        DirNode* node = root_;
+        for (int depth = 0; depth <= kLastDirDepth; ++depth) {
+            const std::uint8_t digit = digit_of(page_key, depth);
+            void* p = node->child[digit];
+            if (p == nullptr) {
+                Leaf* leaf = create_leaf();
+                leaf->page_key = page_key;
+                leaf->parent = node;
+                leaf->parent_digit = digit;
+                node->child[digit] = tag_leaf(leaf);
+                occ_set(node->occ, digit);
+                link_new_leaf(leaf);
+                if (depth == kLastDirDepth) {
+                    near_dir_ = node;
+                    near_dir_prefix_ = page_key >> kDigitBits;
+                }
+                return leaf;
+            }
+            if (is_tagged_leaf(p)) {
+                Leaf* existing = untag_leaf(p);
+                if (existing->page_key == page_key) {
+                    return existing;
+                }
+                assert(depth < kLastDirDepth);
+                DirNode* sub = create_node(static_cast<std::uint8_t>(depth + 1));
+                sub->parent = node;
+                sub->parent_digit = digit;
+                node->child[digit] = sub;
+                node = sub;
+                int cur_depth = depth + 1;
+                while (true) {
+                    const std::uint8_t d_old = digit_of(existing->page_key, cur_depth);
+                    const std::uint8_t d_new = digit_of(page_key, cur_depth);
+                    if (d_old != d_new) {
+                        existing->parent = node;
+                        existing->parent_digit = d_old;
+                        node->child[d_old] = tag_leaf(existing);
+                        occ_set(node->occ, d_old);
+
+                        Leaf* leaf = create_leaf();
+                        leaf->page_key = page_key;
+                        leaf->parent = node;
+                        leaf->parent_digit = d_new;
+                        node->child[d_new] = tag_leaf(leaf);
+                        occ_set(node->occ, d_new);
+                        link_new_leaf(leaf);
+                        if (cur_depth == kLastDirDepth) {
+                            near_dir_ = node;
+                            near_dir_prefix_ = page_key >> kDigitBits;
+                        }
+                        return leaf;
+                    }
+                    DirNode* next_sub = create_node(static_cast<std::uint8_t>(cur_depth + 1));
+                    next_sub->parent = node;
+                    next_sub->parent_digit = d_old;
+                    node->child[d_old] = next_sub;
+                    occ_set(node->occ, d_old);
+                    node = next_sub;
+                    ++cur_depth;
+                }
+            }
+            node = static_cast<DirNode*>(p);
+        }
+        assert(false && "unreachable");
+        return nullptr;
     }
 
     void release_leaf(Leaf* leaf) {
+        if (leaf == best_leaf_) {
+            best_leaf_ = nullptr;
+        }
+        if (leaf == hot_leaf_) {
+            hot_leaf_ = nullptr;
+        }
         unlink_leaf(leaf);
         DirNode* node = leaf->parent;
         const std::uint8_t digit = leaf->parent_digit;
         occ_clear(node->occ, digit);
         node->child[digit] = nullptr;
         recycle_leaf(leaf);
+
         while (node != root_ && !occ_any(node->occ)) {
+            if (node == near_dir_) {
+                near_dir_ = nullptr;
+            }
             DirNode* parent = node->parent;
             const std::uint8_t parent_digit = node->parent_digit;
             occ_clear(parent->occ, parent_digit);
@@ -786,19 +741,35 @@ private:
             recycle_node(node);
             node = parent;
         }
+
+        while (node != root_) {
+            const int sole = occ_single_bit(node->occ);
+            if (sole < 0 || !is_tagged_leaf(node->child[sole])) {
+                break;
+            }
+            if (node == near_dir_) {
+                near_dir_ = nullptr;
+            }
+            Leaf* survivor = untag_leaf(node->child[sole]);
+            DirNode* parent = node->parent;
+            const std::uint8_t parent_digit = node->parent_digit;
+            parent->child[parent_digit] = tag_leaf(survivor);
+            survivor->parent = parent;
+            survivor->parent_digit = parent_digit;
+            recycle_node(node);
+            node = parent;
+        }
     }
 
     [[nodiscard]] Leaf* leftmost_from(DirNode* node, int digit) const {
-        if (node->depth == kLastDirDepth) {
-            return static_cast<Leaf*>(node->child[digit]);
-        }
-        DirNode* cursor = static_cast<DirNode*>(node->child[digit]);
-        while (cursor->depth < kLastDirDepth) {
+        void* p = node->child[digit];
+        while (!is_tagged_leaf(p)) {
+            DirNode* cursor = static_cast<DirNode*>(p);
             const int bit = occ_lowest(cursor->occ);
-            cursor = static_cast<DirNode*>(cursor->child[bit]);
+            assert(bit >= 0);
+            p = cursor->child[bit];
         }
-        const int bit = occ_lowest(cursor->occ);
-        return static_cast<Leaf*>(cursor->child[bit]);
+        return untag_leaf(p);
     }
 
     [[nodiscard]] Leaf* tree_successor(Leaf* leaf) const {
@@ -815,19 +786,6 @@ private:
         return nullptr;
     }
 
-    [[nodiscard]] BookLevel* compute_best_cold() const {
-        if (side_ == Side::Sell) {
-            if (min_leaf_ == nullptr) {
-                return nullptr;
-            }
-            return pool_->get(min_leaf_->handle[occ_lowest(min_leaf_->occ)]);
-        }
-        if (max_leaf_ == nullptr) {
-            return nullptr;
-        }
-        return pool_->get(max_leaf_->handle[occ_highest(max_leaf_->occ)]);
-    }
-
     LevelPool* pool_;
     Side side_;
     DirNode* root_{nullptr};
@@ -835,14 +793,13 @@ private:
     Leaf* free_leaves_{nullptr};
     Leaf* min_leaf_{nullptr};
     Leaf* max_leaf_{nullptr};
+    Leaf* best_leaf_{nullptr};
+    mutable Leaf* hot_leaf_{nullptr};
+    DirNode* near_dir_{nullptr};
+    std::uint64_t near_dir_prefix_{0};
     std::vector<std::unique_ptr<DirNode>> nodes_;
     std::vector<std::unique_ptr<Leaf>> leaves_;
     BookLevel* best_{nullptr};
-    Price hot_origin_{0};
-    int hot_base_{0};
-    std::size_t hot_count_{0};
-    std::uint64_t hot_occ_[kHotOccWords]{};
-    std::uint32_t hot_handle_[kHotTicks]{};
     std::size_t active_{0};
     std::size_t created_nodes_{0};
     std::size_t live_nodes_{0};

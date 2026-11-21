@@ -1,6 +1,6 @@
 # PagedLOB 架构说明与版本演进
 
-本文描述 **v0.4.0** 的 `fastlob::PagedLOB`（含 256-tick **hot window + 物理位图**、**冷区有序双向叶链**、**单数组单次探测 `OrderIdIndex`** 以及 **NASDAQ TotalView-ITCH 5.0 真实行情流式回放器与 Linux PMU 硬件计数器集成**）。定位是一份自包含的架构设计、基准评测与版本演进文档。
+本文描述 **v0.5.0** 的 `fastlob::PagedLOB`（**零迁移统一分页基数目录 + 三级页缓存 `best_leaf_`/`hot_leaf_`/`near_dir_` + 单叶标记路径压缩 + `BookLevel::owner_page` $O(1)$ 关档 + 零分配内联回调/原生 IOC + NASDAQ TotalView-ITCH 5.0 真实行情流式回放器 + `flash1-dev/matching-engine-benchmark` 无影子适配器**）。定位是一份自包含的架构设计、基准评测与版本演进文档。
 
 对照数字全部来自 **2026-11-21（America/New_York, EST）** 在本仓库 Release 二进制上重跑的结果，见 [§4](#4-benchmark)；历史每次版本改动及指标变化见 [§8 版本演进日志（Changelog）](#8-版本演进日志changelog)。
 
@@ -49,10 +49,10 @@ PagedLOB 是内存里的 **L3** 限价订单簿：每个 `Order` 保留身份、
 |---|---:|---|
 | `Order` | 56 | 含侵入式 `prev`/`next` 与 32-bit `level_handle`，紧凑排布以提高缓存密度 |
 | `OrderIdIndex::Entry` | 16 | `{OrderId key, Order* val}` 单数组相邻存放，每条 64B 缓存行容纳 4 个槽位 |
-| `BookLevel` | 40 | `Order* head/tail`、64-bit `total_qty`、`order_count`、`price`、`side` |
-| `DirNode` | 2104 | `occ[4]`（32B）+ `child[256]`（2048B）+ 父指针与 free-list 元数据 |
+| `BookLevel` | 48 | `Order* head/tail`、64-bit `total_qty`、`void* owner_page`（$O(1)$ 叶回指）、`price`、`side` |
+| `DirNode` | 2104 | `occ[4]`（32B）+ `child[256]`（2048B，支持 `uintptr_t \| 1` 单叶路径压缩）+ 父指针与 free-list 元数据 |
 | `Leaf`（256 tick） | 1104 | **首条 64B 缓存行打包 `occ[4]` + `page_key` + `prev_leaf` + `next_leaf` + `parent`**，随后紧跟 `handle[256]`（1024B） |
-| 热环状态（每侧） | 1056 | `hot_handle_[256]`（1024B）+ `hot_occ_[4]`（32B） |
+| 三级页缓存状态（每侧） | 32 | `best_leaf_` + MRU `hot_leaf_` + `near_dir_`（256 邻页 = 65,536 tick $O(1)$ 直达）+ `near_dir_prefix_` |
 
 ### 2.1 价位键编码
 
@@ -89,17 +89,19 @@ PagedLOB 是内存里的 **L3** 限价订单簿：每个 `Order` 保留身份、
   - 扣单/减量使用 `find_with_slot(id, slot)` + 归零时 `erase_slot(slot)`。
 - **无墓碑 Knuth Algorithm R 回移**：以模掩码无分支距离比较 `((i - home) & mask_) >= ((i - hole) & mask_)` 修复探测簇，且探测循环带 `step < capacity_` 上界保护，`NDEBUG` 满表时安全返回 `false` 绝不死循环。
 
-### 2.5 `best_` 与带物理位图的 256-tick 热环
+### 2.5 v0.5.0 架构演进：从「互斥拷贝热环」到「零迁移统一分页 + 三级页缓存 + 单叶路径压缩」
 
-每侧 `PagedPriceIndex` 维护：
+在 v0.2.0~v0.4.0 中，`PagedPriceIndex` 采用围绕 `best_` 旋转的独立 `hot_handle_[256]` 拷贝环与冷区 Radix 互斥分层。该设计在真实连续行情（ITCH 5.0）下表现优异，但在公开基准 [`flash1-dev/matching-engine-benchmark`](https://github.com/flash1-dev/matching-engine-benchmark) 的高波动洗牌流（`normal` / `swing-25` / `swing-40` / `flash-crash`：几何布朗运动全程均匀随机洗牌到达，订单中位寿命仅 `0.43 ms`）中暴露出结构性退化：**冷热乒乓抖动（Hot-Cold Ping-Pong Thrashing）**——每当一张偏离盘口 `> 256` tick 的瞬时更优挂单到达并在微秒后撤单/成交，`hot_origin_ == best_` 的强绑定都会迫使 `promote_better_origin` 将原热环内的 150~200 个活跃档位批量迁入冷区 Radix，紧接着又在撤单瞬间触发 `steal_cold_into_hot` 将这 150~200 个档位全量迁回热环（诊断实验证实：在 `swing-25` 上，反直觉地将 `HotTicks` 从 `1024` 缩小到 `64`，吞吐反而从 `0.62 M/s` 暴涨 **7.2×** 至 `4.45 M/s`）。
 
-- `BookLevel* best_`：最优档指针（空侧为 `nullptr`）
-- `Price hot_origin_`：热环原点（非空时恒等于 `best_->price`）
-- `int hot_base_`：环形旋转下标（`0..255`）
-- `uint32_t hot_handle_[256]`：逻辑偏移 `off` 映射到物理槽 `(hot_base_ + off) & 255`
-- `uint64_t hot_occ_[4]` + `size_t hot_count_`：**按物理环槽位编号**的 256-bit 占用位图与活跃计数
+**v0.5.0 彻底消除了热冷档位迁移**：
 
-**核心技巧（物理位图免移位）**：因为 `hot_occ_` 按物理下标 `idx` 而非逻辑 `off` 置位，当 `best_` 旋转 `hot_base_` 时，**完全不需要对 256-bit 位图做跨字移位**！按价格序扫描热环只需拆成两段单调物理区间：`[hot_base_, 256)` 与 `[0, hot_base_)`，每段直接用 `w &= (w - 1)` + `std::countr_zero(w)` 逐字紧凑输出。当最后一档被打穿变空簿时（如 `match_touch`），`hot_occ_` 已自然归零，无需任何 1 KiB `memset` 或 256 槽空扫。
+1. **零迁移统一页驻留（Zero-Migration Unified Leaf Residency）**：每个活跃 `BookLevel` 自创建起至清空止，永久驻留在其自然对齐的 `2^PageBits`-tick `Leaf` 页内，删除 `hot_handle_` 拷贝环及 `promote_better_origin` / `steal_cold_into_hot` 批量搬迁。瞬时远端尖峰挂单仅置位目标 `Leaf` 的 1 个 bit 并更新 `best_` / `best_leaf_`；其撤单后通过 `min_leaf_` / `max_leaf_` 双向叶链在 **$O(1)$** 内恢复原盘口，**已有档位 0 字节移动**。
+2. **`BookLevel::owner_page` $O(1)$ 反向指针关档**：`BookLevel` 内新增 `void* owner_page`（结构总长 `48 B` 仍居单条缓存行内），使任意价位撤单或吃空触发 `close(level)` 时直接定位所属 `Leaf*`，**彻底免除撤单路径上的 7 层 Radix 查找**。
+3. **三级零迁移页缓存（Three-Tier Page Cache）**：
+   - **Tier 0（`best_leaf_` + MRU `hot_leaf_`）**：覆盖 `best_` 所在页与最近访问邻页（跨页边界共 `512` tick），寄存器级 `page_key` 命中即走单调无回绕数组下标（比旧版模环省去 `(hot_base_ + off) & mask`）。
+   - **Tier 1（`near_dir_` 末级目录缓存）**：缓存 `depth == kLastDirDepth` 的 `DirNode*` 及其高 48 位前缀 `near_dir_prefix_`。单个 `near_dir_` 覆盖 **256 个连续叶 = 65,536 个连续 tick**（`$0.01` tick 下覆盖 `$655.36` 价格跨度），使真实股票全天行情与大幅波动压力测试 **100% 在单次数组下标 `near_dir_->child[page_key & 0xFF]` 内直达目标叶，完全跳过上层 6 级 `DirNode`**。
+   - **Tier 2（单叶指针标记路径压缩，`uintptr_t | 1`）**：当任意子树内仅有唯一活跃 `Leaf` 时，直接将 `Leaf* | 1` 挂载在最高分叉祖先 `DirNode` 槽位而不展开下层目录链；叶销毁导致兄弟仅剩单叶时自动向上折叠回收空链，使极端 64-bit 随机跳价 `sparse_jump` 结构内存从 **11.16 MB 降至 2.54 MB（压缩 4.39×）**、延迟从 **859 ns 降至 252 ns（提速 3.41×）**。
+4. **零分配内联成交回调与原生 IOC / `cancel_ex`（`StorageBook`）**：新增模板内联回调 `match_limit_cb`、`match_ioc_cb`（原生 Immediate-Or-Cancel，未成交残余直接过期不入池/不入哈希表）、`match_market_cb` 以及直接从 `OrderPool` 返回 `{ok, side, price, qty}` 的 `cancel_ex(id)`，配合吃单内层同价位紧凑摘头循环，消除外部 `std::vector<Fill>` 缓冲与外挂订单影子数组。
 
 ### 2.6 结构关系图
 
@@ -311,35 +313,60 @@ flowchart TB
 - **四簿全天逐日差分验证**：在 `AAPL`（`1,609,147` 事件，峰值活跃挂单 `27,110`）、`SPY`（`2,249,458` 事件，峰值活跃挂单 `1,949`）、`MSFT`（`1,270,785` 事件，峰值活跃挂单 `23,005`）合计 **5,129,390 条真实 L3 订单簿事件**上，`PagedLOB`、`MapStorageBook`（`std::map`）、`FastOrderBook`（`v1`）与 `ReferenceOrderBook`（`std::map + std::list`）在日内 100 个等距检查点及收盘时刻的 `order_count`、BBO 与买卖前 10 档 L2 深度 **100% 逐位一致**。
 - **256-tick（`$2.56`）热环命中率实证**：真实行情下，`SPY`（中枢价 `$321.30`）**91.48%**、`MSFT`（`$157.89`）**88.28%**、`AAPL`（`$290.25`，散户远端挂单深）**75.08%** 的新增挂单直接命中 1,056B 热环，无需触碰冷区基数树。
 
-单核绑核（`taskset -c 0`，`g++-13 -O3 -DNDEBUG`，预热 1 轮 + 正式测量 5 轮，`batch=128`）实测结果：
+单核绑核（`taskset -c 0`，`g++-13 -O3 -DNDEBUG`，预热 1 轮 + 正式测量 5 轮，`batch=128`）**v0.5.0** 实测结果：
 
-| 标的 | 订单簿实现 | 全天事件数 | 热环命中率 | Mops/s | p50 (ns) | p99 (ns) | p99.9 (ns) | 全天 6.5h 回放耗时 |
+| 标的 | 订单簿实现 | 全天事件数 | 256-Tick 近盘口占比 | Mops/s | p50 (ns) | p99 (ns) | p99.9 (ns) | 全天 6.5h 回放耗时 |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| **AAPL** | **PagedLOB** | 1,609,147 | 75.08% | **37.28** | **25.7** | **37.8** | **102.7** | **43.2 ms** |
-| AAPL | `std::map` (`MapStorageBook`) | 1,609,147 | — | 21.79 | 44.6 | 68.1 | 128.4 | 73.8 ms |
-| AAPL | `ref_map_list` | 1,609,147 | — | 11.27 | 86.9 | 121.5 | 177.1 | 142.7 ms |
-| AAPL | `v1` (`FastOrderBook`) | 1,609,147 | — | 7.30 | 122.4 | 338.0 | 2,397.4 | 220.6 ms |
-| **SPY** | **PagedLOB** | 2,249,458 | 91.48% | **53.26** | **17.5** | **30.2** | **90.4** | **42.2 ms** |
-| SPY | `v1` (`FastOrderBook`) | 2,249,458 | — | 42.32 | 23.2 | 40.6 | 103.1 | 53.2 ms |
-| SPY | `std::map` (`MapStorageBook`) | 2,249,458 | — | 37.27 | 25.0 | 62.5 | 109.5 | 60.4 ms |
-| SPY | `ref_map_list` | 2,249,458 | — | 14.89 | 65.1 | 102.4 | 180.7 | 151.1 ms |
-| **MSFT** | **PagedLOB** | 1,270,785 | 88.28% | **42.32** | **22.2** | **33.8** | **109.1** | **30.0 ms** |
-| MSFT | `std::map` (`MapStorageBook`) | 1,270,785 | — | 28.80 | 32.8 | 60.0 | 114.0 | 44.1 ms |
-| MSFT | `v1` (`FastOrderBook`) | 1,270,785 | — | 20.15 | 36.2 | 178.2 | 2,016.6 | 63.1 ms |
-| MSFT | `ref_map_list` | 1,270,785 | — | 11.91 | 81.0 | 125.2 | 189.9 | 106.7 ms |
+| **SPY** | **PagedLOB v0.5.0** | 2,249,458 | 91.48% | **62.67** | **15.1** | **23.1** | **31.6** | **35.9 ms** |
+| SPY | `v1` (`FastOrderBook`) | 2,249,458 | — | 42.23 | 23.3 | 40.6 | 95.8 | 53.3 ms |
+| SPY | `std::map` (`MapStorageBook`) | 2,249,458 | — | 38.47 | 25.0 | 41.5 | 94.9 | 58.5 ms |
+| SPY | `ref_map_list` | 2,249,458 | — | 15.15 | 64.6 | 89.0 | 150.8 | 148.5 ms |
+| **MSFT** | **PagedLOB v0.5.0** | 1,270,785 | 88.28% | **52.02** | **18.5** | **26.5** | **57.4** | **24.4 ms** |
+| MSFT | `std::map` (`MapStorageBook`) | 1,270,785 | — | 29.20 | 33.0 | 55.0 | 112.7 | 43.5 ms |
+| MSFT | `v1` (`FastOrderBook`) | 1,270,785 | — | 20.43 | 35.9 | 177.3 | 1,981.7 | 62.2 ms |
+| MSFT | `ref_map_list` | 1,270,785 | — | 11.96 | 79.9 | 128.7 | 197.0 | 106.2 ms |
+| **AAPL** | **PagedLOB v0.5.0** | 1,609,147 | 75.08% | **43.95** | **21.9** | **30.6** | **87.9** | **36.6 ms** |
+| AAPL | `std::map` (`MapStorageBook`) | 1,609,147 | — | 21.99 | 44.2 | 65.9 | 122.3 | 73.2 ms |
+| AAPL | `ref_map_list` | 1,609,147 | — | 11.28 | 86.5 | 126.1 | 186.4 | 142.7 ms |
+| AAPL | `v1` (`FastOrderBook`) | 1,609,147 | — | 7.38 | 120.5 | 336.6 | 2,406.7 | 218.0 ms |
 
 关键观察：
-- **在全部三只代表性标的上，`PagedLOB` 均在 **30~43 ms** 内复现完整个 6.5 小时交易日行情**（吞吐 **37.3~53.3 Mops/s**）。
-- 在挂单档位极深的 `AAPL` 上，平面结构 `v1` 因远端开新档线性扫描退化至 `7.30 Mops/s` 且 `p99.9` 飙升至 `2,397.4 ns`；`PagedLOB` 依靠冷区页式基数树与双向叶链实现 **5.11× 吞吐提升** 与 **23.3× `p99.9` 长尾延迟压缩**（`102.7 ns`），同时较同池化 `std::map` 快 **1.71×**。
+- **消除热冷迁移并引入 `owner_page` $O(1)$ 关档后，v0.5.0 在三只真实标的上较 v0.4.0 进一步全面提速 18%~23%**（吞吐跃升至 **43.95~62.67 Mops/s**，单核 **24.4~36.6 ms** 跑完整个 6.5 小时交易日，`SPY` `p99.9` 从 `90.4 ns` 压低 **2.86×** 至 **31.6 ns**）。
+- 在挂单档位极深的 `AAPL` 上，`PagedLOB v0.5.0` 较平面结构 `v1` 实现 **5.96× 吞吐提升** 与 **27.4× `p99.9` 长尾延迟压缩**（`87.9 ns` vs `2,406.7 ns`），同时较同池化 `std::map` 快 **2.00×**。
 - **裸金属硬件 PMU 采样**：`bench/perf_counters.hpp` 通过 Linux `perf_event_open` 仅包裹纯热循环（零文件加载噪声），在开放硬件 PMU 的物理机或 WSL 上执行 `./scripts/run_remote_perf.sh <ssh-host> [--download-itch]` 即可一键输出 `cycles/ev`、`IPC`、`L1d-load-misses/1k` 与 `LLC-load-misses/1k` 表格。
+
+### 4.8 公开权威基准评测：`flash1-dev/matching-engine-benchmark` 全场景正面对决
+
+为检验引擎在高波动对抗场景与完整交易所回报流（OrderAck / Trade / CancelAck / ModifyAck / Reject + SPSC 跨线程传输队列 + 随机时刻盘口审计）下的真实表现，`adapters/matching_engine_benchmark/pagedlob_adapter.cpp` 实现了零外部影子状态的 C ABI 适配器，在同一台机器上与该榜单排名第一的开源 C++ 引擎 **`lcv3`（LC++ v3，Treap + 外部槽位/价格数组）** 及多款主流引擎同场评测：
+
+- **严苛正确性门禁 100% 通过**：
+  - `conformance_check.py`：**34/34** 边界与极端微观用例（含 5,000 档深扫、改单穿价成交、IOC 部分成交残余过期、成交/撤单后 ID 复用等）回报流 SHA-256 与盘口状态审计全绿通过（`CONFORMANT`）。
+  - `run_challenge.py`：**5/5** 标准场景（每场景 2,000,000 条消息）SHA-256 哈希与 **960/960**（`5 × 192`）随机时刻 `liquibook` 状态审计全部 `PASS`（`Verdict: VALID`）。
+  - `validate_seeds.py`：从 10,000 个公开种子池随机抽取 10 个种子 × 5 大场景 = **50/50 单元（约 1 亿条消息）100% 通过**。
+
+5 轮中位数吞吐率对比（单位：**M msgs/s**，`scripts/run_challenge.py --perf-runs 5 --compare`，按基准定义的「五场景最差吞吐 Worst-Case」排序）：
+
+| 引擎 | 核心索引结构 | `static` | `normal` | `swing-25` | `swing-40` | `flash-crash` | **Worst-Case M/s** | 裁定 |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| **PagedLOB v0.5.0** | **零迁移分页 Radix + 三级页缓存 + 内置 16B 哈希** | **17.12** | **11.38** | **12.03** | **10.34** | 10.70 | **10.34** (`swing-40`) | **VALID** |
+| `lcv3` (LC++ v3) | Treap + 适配器外挂 `g_slot_id`/`g_price` 平铺数组 | 16.87 | 8.64 | 9.88 | 9.57 | **10.75** | 8.64 (`normal`) | VALID |
+| `cpp_orderbook` | 红黑树 + 哈希表 | 6.45 | 6.75 | 5.71 | 5.94 | 6.34 | 5.71 (`swing-25`) | VALID |
+| `cpptrader` | 侵入式 AVL 树 + 哈希表 | 5.33 | 5.48 | 4.96 | 5.40 | 5.23 | 4.96 (`swing-25`) | VALID |
+| `kautenja` | 非平衡 BST + 映射表 | 3.61 | 5.15 | 5.99 | 5.57 | 5.56 | 3.61 (`static`) | VALID |
+| `PagedLOB v0.4.0`（旧版） | 256-tick 拷贝热环 + 冷区 Radix（存在冷热乒乓迁移） | 10.05 | 1.40 | 2.09 | 3.90 | 3.51 | 1.40 (`normal`) | VALID |
+| `brprojects` (`br-avl`) | 双向链 AVL + `unordered_map` | 5.98 | 0.50 | 0.16 | 0.23 | 0.56 | 0.16 (`swing-25`) | VALID |
+
+关键突破：
+- **Worst-Case 从 v0.4.0 的 `1.40 M/s` 跃升至 `10.34 M/s`（提速 `7.39×`）**，`normal` 场景提速 **8.13×**（`1.40 → 11.38 M/s`），`swing-25` 提速 **5.76×**（`2.09 → 12.03 M/s`）。
+- 在引擎内部完整维护任意 64-bit `OrderId` 哈希表（零外部平铺数组作弊/辅助）的前提下，**Worst-Case 吞吐正面超越开源榜首 `lcv3` 达 +19.7%（`10.34` vs `8.64 M/s`）**，并在 5 个场景中的 4 个取得领先，同时领先 `cpp_orderbook` **1.81×**、`cpptrader` **2.08×**、`brprojects` **64.6×**。
 
 ---
 
 ## 5. 当前已知边界与后续演进方向
 
-1. **极端稀疏远跳插入（`sparse_jump`）仍是结构性取舍**（859 ns / 11.16 MB vs `Liquibook` 102 ns / 0.44 MB）：未压缩的 8-bit 固定步长 radix 在高位分散键上会为每条孤立路径分配 6 个 `DirNode`（每个 2,104 B）。后续若需兼顾全范围随机跳价，可引入 **自适应路径压缩（ART Node4/Node16/Node48 + 单子前缀折叠）**，将稀疏内存降低一个数量级以上。
-2. **跨页 `sweep_across` 略慢于纯平面链表 `v1`**（324.6 ns vs `v1` 203.1 ns，但已快于 `Liquibook` 394.4 ns 与 `std::map` 385.2 ns）：`v1` 直接串接 `BookLevel*`（每档 40 B），而冷区叶链每页需先读 `Leaf` 首缓存行位图再通过 `LevelPool` 取 `BookLevel`。
-3. **交易所微观规则与并发包装**：目前不含 STP（自成交预防）、Post-Only / IOC / FOK 订单属性、原地改价及单写多读 SeqLock 快照发布层，可按需在 `StorageBook` 外层或策略参数中扩展。
+1. **极端 64-bit 随机稀疏远跳（`sparse_jump`）已由单叶路径压缩大幅收敛，但稠密多子分叉节点仍为固定 256 路**：v0.5.0 引入 `uintptr_t | 1` 单叶标记路径压缩与自动折叠后，`sparse_jump` 结构内存已从 `11.16 MB` 降至 **2.54 MB（压缩 4.39×）**、p50 从 `859 ns` 降至 **252 ns（提速 3.41×）**；若后续还需进一步压缩中层 2~16 路稀疏分叉节点，可将 `DirNode` 细化为 **ART `Node4/Node16/Node48/Node256`**。
+2. **跨页 `sweep_across` 略慢于纯平面链表 `v1`**（每页需先读 `Leaf` 首缓存行位图再经 `LevelPool` 取 `BookLevel`），若业务以超大跨度稀疏快照为主可选编译期窄页 `PagedStorageBookT<6>`（64 tick/叶，`walk_1_per_page = 203.5 ns`）。
+3. **交易所微观规则与并发包装**：v0.5.0 已原生支持 **IOC（`match_ioc` / `match_ioc_cb`）**、零分配内联回调与 `cancel_ex`；目前暂不含 STP（自成交预防）、FOK / Post-Only / 冰山单及单写多读 SeqLock 快照发布层，可按需在 `StorageBook` 外层扩展。
 
 ---
 
@@ -386,6 +413,19 @@ flowchart TB
 ## 8. 版本演进日志（Changelog）
 
 > **文档维护约定**：每次对 `PagedLOB` 数据结构、关键路径、API 或基准测试做版本改动时，必须同步更新正文对应章节，并在本节顶部或底部追加一条版本记录（含日期、版本号/提交、核心改动与关键基准变化）。
+
+### v0.5.0 — 2026-11-21（America/New_York, EST）
+- **零迁移统一分页架构与三级页缓存（根治高波动冷热乒乓抖动）**：
+  - 重构 `include/fastlob/paged_price_index.hpp`：移除独立 `hot_handle_` 拷贝环与 `promote_better_origin` / `steal_cold_into_hot` 批量档位搬迁，所有活跃 `BookLevel` 自创建至清空永久驻留于对齐的 `2^PageBits`-tick `Leaf` 页内。
+  - `BookLevel`（`include/fastlob/level_pool.hpp`）新增 `void* owner_page`（`sizeof(BookLevel) == 48`），使任意深度撤单或吃空触发 `close(level)` 均为严格 $O(1)$，彻底免除撤单路径 Radix 查找。
+  - 引入三级零迁移页缓存：Tier 0（`best_leaf_` + MRU `hot_leaf_` 覆盖跨页边界 512 tick $O(1)$ 直达）、Tier 1（`near_dir_` 缓存末级 `DirNode*`，单次数组下标覆盖 `256 × 256 = 65,536` 连续 tick）、Tier 2（`uintptr_t | 1` 单叶指针标记路径压缩与单叶链自动向上折叠回收）。
+- **零分配内联回调、原生 IOC 与 `matching-engine-benchmark` 权威评测登顶**：
+  - `StorageBook`（`include/fastlob/storage_book.hpp`）新增 `match_limit_cb`、`match_ioc_cb`、`match_market_cb`、`match_ioc` 与 `cancel_ex`，并优化同档连续吃单摘头内循环。
+  - 新增 `adapters/matching_engine_benchmark/{pagedlob_adapter.cpp,build.sh}`（零外挂 `g_side`/`g_price`/`g_slot_id` 影子数组），100% 通过 **34/34** `conformance_check.py`、**5/5** 标准哈希 + **960/960** 状态审计及 **50/50** 多随机种子测试。
+- **基准飞跃（相对 v0.4.0）**：
+  - `flash1-dev/matching-engine-benchmark` 五场景最差吞吐（Worst-Case）从 **1.40 M/s 暴涨 7.39× 至 10.34 M/s**（`static 17.12`、`normal 11.38`、`swing-25 12.03`、`swing-40 10.34`、`flash-crash 10.70 M/s`），**正面超越原开源第一名 `lcv3`（Worst-Case `8.64 M/s`）达 +19.7%**。
+  - NASDAQ ITCH 5.0 全天真实回放全面再提速 **18%~23%**：`SPY` **53.26 → 62.67 Mops/s**（`p50 = 15.1 ns`，`p99.9` **90.4 → 31.6 ns**，全天 `35.9 ms`）、`MSFT` **42.32 → 52.02 Mops/s**（`18.5 ns`，全天 `24.4 ms`）、`AAPL` **37.28 → 43.95 Mops/s**（`21.9 ns`，全天 `36.6 ms`）。
+  - 内部微基准同步大幅跃升：`churn_10k` **49.2 → 38.0 ns（25.99 Mops/s）**，`match_walk8` **23.2 → 21.1 ns（45.24 Mops/s）**，`sparse_jump` 延迟 **859 → 252 ns（3.41×）**、结构内存 **11.16 MB → 2.54 MB（压缩 4.39×）**。
 
 ### v0.4.0 — 2026-11-21（America/New_York, EST）
 - **真实市场全天回放与协议解析（NASDAQ TotalView-ITCH 5.0）**：

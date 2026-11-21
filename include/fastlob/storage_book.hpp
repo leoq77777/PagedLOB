@@ -45,6 +45,13 @@ struct BookMemory {
     }
 };
 
+struct CancelInfo {
+    bool ok{false};
+    Side side{Side::Buy};
+    Price price{0};
+    Qty qty{0};
+};
+
 template <typename PriceIndex>
 class StorageBook {
 public:
@@ -75,11 +82,55 @@ public:
         return insert_at_slot(id_slot, id, side, price, qty, ts);
     }
 
+    /// Cross the opposite side at the maker price, invoking `on_fill(const Fill&)` inline per fill,
+    /// then rest any remainder. Zero heap allocations.
+    template <typename OnFill>
+    MatchResult match_limit_cb(OrderId id, Side side, Price price, Qty qty, OnFill&& on_fill,
+                               Timestamp ts = 0) {
+        return match_incoming_cb(id, side, price, qty, /*market=*/false, /*rest=*/true, ts,
+                                 std::forward<OnFill>(on_fill));
+    }
+
+    /// Immediate-Or-Cancel (IOC): cross opposite side up to `price`, invoking `on_fill(const Fill&)`
+    /// inline per fill; any unfilled remainder expires immediately without resting.
+    template <typename OnFill>
+    MatchResult match_ioc_cb(OrderId id, Side side, Price price, Qty qty, OnFill&& on_fill,
+                             Timestamp ts = 0) {
+        return match_incoming_cb(id, side, price, qty, /*market=*/false, /*rest=*/false, ts,
+                                 std::forward<OnFill>(on_fill));
+    }
+
+    /// Walk the opposite side until qty is gone or book is empty, invoking `on_fill(const Fill&)`.
+    template <typename OnFill>
+    MatchResult match_market_cb(OrderId id, Side side, Qty qty, OnFill&& on_fill,
+                                Timestamp ts = 0) {
+        const Price cap = side == Side::Buy ? std::numeric_limits<Price>::max()
+                                            : std::numeric_limits<Price>::min();
+        return match_incoming_cb(id, side, cap, qty, /*market=*/true, /*rest=*/false, ts,
+                                 std::forward<OnFill>(on_fill));
+    }
+
     /// Cross the opposite side at the maker price, then rest any remainder.
     /// Does not run inside apply(); MBO replay stays event-faithful.
     MatchResult match_limit(OrderId id, Side side, Price price, Qty qty, Timestamp ts = 0,
                             std::vector<Fill>* fills = nullptr) {
-        return match_incoming(id, side, price, qty, /*market=*/false, ts, fills);
+        return match_incoming_cb(
+            id, side, price, qty, /*market=*/false, /*rest=*/true, ts, [&](const Fill& f) {
+                if (fills != nullptr) {
+                    fills->push_back(f);
+                }
+            });
+    }
+
+    /// Immediate-Or-Cancel (IOC): cross opposite side up to `price`; remainder does not rest.
+    MatchResult match_ioc(OrderId id, Side side, Price price, Qty qty, Timestamp ts = 0,
+                          std::vector<Fill>* fills = nullptr) {
+        return match_incoming_cb(
+            id, side, price, qty, /*market=*/false, /*rest=*/false, ts, [&](const Fill& f) {
+                if (fills != nullptr) {
+                    fills->push_back(f);
+                }
+            });
     }
 
     /// Walk the opposite side until qty is gone or the book is empty. Remainder does not rest.
@@ -87,7 +138,12 @@ public:
                              std::vector<Fill>* fills = nullptr) {
         const Price cap = side == Side::Buy ? std::numeric_limits<Price>::max()
                                             : std::numeric_limits<Price>::min();
-        return match_incoming(id, side, cap, qty, /*market=*/true, ts, fills);
+        return match_incoming_cb(
+            id, side, cap, qty, /*market=*/true, /*rest=*/false, ts, [&](const Fill& f) {
+                if (fills != nullptr) {
+                    fills->push_back(f);
+                }
+            });
     }
 
     bool cancel(OrderId id) {
@@ -97,6 +153,17 @@ public:
         }
         unlink_and_free(order);
         return true;
+    }
+
+    /// Cancel `id` and return its resting `{ok, side, price, qty}` directly from `OrderPool`.
+    CancelInfo cancel_ex(OrderId id) {
+        Order* order = ids_.take(id);
+        if (order == nullptr) {
+            return {};
+        }
+        const CancelInfo info{true, order->side, order->price, order->qty};
+        unlink_and_free(order);
+        return info;
     }
 
     /// Qty decrease only. new_qty == 0 cancels. An increase is rejected.
@@ -288,19 +355,9 @@ private:
         finish_depleted_order(level, order);
     }
 
-    void apply_maker_fill(BookLevel* level, Order* maker, Qty take) {
-        assert(maker->qty >= take);
-        assert(level->total_qty >= take);
-        maker->qty -= take;
-        level->total_qty -= take;
-        if (maker->qty == 0) {
-            ids_.erase(maker->order_id);
-            finish_depleted_order(level, maker);
-        }
-    }
-
-    MatchResult match_incoming(OrderId id, Side side, Price price, Qty qty, bool market, Timestamp ts,
-                               std::vector<Fill>* fills) {
+    template <typename OnFill>
+    MatchResult match_incoming_cb(OrderId id, Side side, Price price, Qty qty, bool market,
+                                  bool rest, Timestamp ts, OnFill&& on_fill) {
         MatchResult result;
         if (id == kInvalidOrderId || qty == 0) {
             return result;
@@ -320,17 +377,36 @@ private:
             if (!market && !crosses(side, price, level->price)) {
                 break;
             }
-            Order* maker = level->head;
-            assert(maker != nullptr);
-            const Qty take = std::min(result.remaining, maker->qty);
-            if (fills != nullptr) {
-                fills->push_back(Fill{maker->order_id, id, level->price, take});
+            const Price exec_px = level->price;
+            while (result.remaining > 0) {
+                Order* maker = level->head;
+                assert(maker != nullptr);
+                const Qty take = std::min(result.remaining, maker->qty);
+                on_fill(Fill{maker->order_id, id, exec_px, take});
+                result.filled += take;
+                result.remaining -= take;
+                if (maker->qty > take) {
+                    maker->qty -= take;
+                    level->total_qty -= take;
+                    break;
+                }
+                ids_.erase(maker->order_id);
+                Order* next_maker = maker->next;
+                level->head = next_maker;
+                level->total_qty -= take;
+                maker->next = nullptr;
+                pool_.deallocate(maker);
+                --order_count_;
+                if (next_maker != nullptr) {
+                    next_maker->prev = nullptr;
+                } else {
+                    level->tail = nullptr;
+                    opposite.close(level);
+                    break;
+                }
             }
-            result.filled += take;
-            result.remaining -= take;
-            apply_maker_fill(level, maker, take);
         }
-        if (result.remaining > 0 && !market) {
+        if (result.remaining > 0 && rest) {
             if (result.filled == 0) {
                 if (pool_.free_count() == 0) {
                     result.ok = false;

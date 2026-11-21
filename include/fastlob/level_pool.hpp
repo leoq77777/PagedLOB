@@ -17,6 +17,7 @@ struct BookLevel {
     std::uint64_t total_qty{0};
     Order* head{nullptr};
     Order* tail{nullptr};
+    void* owner_page{nullptr};
     std::uint32_t next_free{0};
     Side side{Side::Buy};
     bool active{false};
@@ -74,6 +75,7 @@ public:
         level.total_qty = 0;
         level.head = nullptr;
         level.tail = nullptr;
+        level.owner_page = nullptr;
         level.next_free = 0;
         level.active = true;
         ++live_;
@@ -87,6 +89,7 @@ public:
         level->active = false;
         level->head = nullptr;
         level->tail = nullptr;
+        level->owner_page = nullptr;
         level->total_qty = 0;
         level->next_free = free_head_;
         free_head_ = handle;

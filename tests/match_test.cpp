@@ -210,3 +210,42 @@ TEST(Match, FindScrubsInternalLinksAndFullIdIndexTerminates) {
     EXPECT_EQ(idx.find(8), nullptr);
     EXPECT_EQ(idx.find(16), &dummy);
 }
+
+TYPED_TEST(MatchBook, IocAndCallbackAndCancelEx) {
+    ASSERT_TRUE(this->book.add(1, Side::Sell, 100, 4));
+    ASSERT_TRUE(this->book.add(2, Side::Sell, 101, 5));
+
+    // Non-crossing IOC expires immediately without resting.
+    const auto miss = this->book.match_ioc(10, Side::Buy, 99, 7);
+    EXPECT_TRUE(miss.ok);
+    EXPECT_EQ(miss.filled, 0u);
+    EXPECT_EQ(miss.remaining, 7u);
+    EXPECT_FALSE(miss.rested);
+    EXPECT_EQ(this->book.order_count(), 2u);
+
+    // Partial-crossing IOC takes Sell@100 (4) and expires remaining 6 without touching Sell@101.
+    std::vector<Fill> cb_fills;
+    const auto hit = this->book.match_ioc_cb(
+        11, Side::Buy, 100, 10, [&](const Fill& f) { cb_fills.push_back(f); });
+    EXPECT_TRUE(hit.ok);
+    EXPECT_EQ(hit.filled, 4u);
+    EXPECT_EQ(hit.remaining, 6u);
+    EXPECT_FALSE(hit.rested);
+    ASSERT_EQ(cb_fills.size(), 1u);
+    EXPECT_EQ(cb_fills[0].maker_id, 1u);
+    EXPECT_EQ(cb_fills[0].price, 100);
+    EXPECT_EQ(cb_fills[0].qty, 4u);
+    EXPECT_EQ(this->book.order_count(), 1u);
+    EXPECT_EQ(this->book.best_price(Side::Sell), 101);
+
+    // cancel_ex returns resting metadata and rejects absent orders.
+    const auto c_ok = this->book.cancel_ex(2);
+    EXPECT_TRUE(c_ok.ok);
+    EXPECT_EQ(c_ok.side, Side::Sell);
+    EXPECT_EQ(c_ok.price, 101);
+    EXPECT_EQ(c_ok.qty, 5u);
+    EXPECT_EQ(this->book.order_count(), 0u);
+
+    const auto c_bad = this->book.cancel_ex(2);
+    EXPECT_FALSE(c_bad.ok);
+}

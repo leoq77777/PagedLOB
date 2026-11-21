@@ -163,45 +163,12 @@ bool expect_match(const char* where, const Books& books, const std::vector<Order
     return ok;
 }
 
-bool in_hot_window(Side side, Price best, Price price) {
-    constexpr int kHot = fastlob::PagedPriceIndex<>::kHotTicks;
-    if (side == Side::Sell) {
-        if (price < best) {
-            return false;
-        }
-        return static_cast<std::uint64_t>(price) - static_cast<std::uint64_t>(best) <
-               static_cast<std::uint64_t>(kHot);
-    }
-    if (price > best) {
-        return false;
-    }
-    return static_cast<std::uint64_t>(best) - static_cast<std::uint64_t>(price) <
-           static_cast<std::uint64_t>(kHot);
-}
-
 std::size_t live_pages(const std::vector<std::tuple<OrderId, Side, Price, Qty>>& live) {
-    std::optional<Price> best_bid;
-    std::optional<Price> best_ask;
-    for (const auto& [id, side, price, qty] : live) {
-        (void)id;
-        (void)qty;
-        if (side == Side::Buy) {
-            if (!best_bid || price > *best_bid) {
-                best_bid = price;
-            }
-        } else if (!best_ask || price < *best_ask) {
-            best_ask = price;
-        }
-    }
     std::set<std::uint64_t> bids;
     std::set<std::uint64_t> asks;
     for (const auto& [id, side, price, qty] : live) {
         (void)id;
         (void)qty;
-        const std::optional<Price> best = side == Side::Buy ? best_bid : best_ask;
-        if (best && in_hot_window(side, *best, price)) {
-            continue;
-        }
         (side == Side::Buy ? bids : asks).insert(tick_page_key(price));
     }
     return bids.size() + asks.size();
@@ -320,7 +287,7 @@ TEST(PriceIndex, FullPageAndNextPage) {
         live.push_back(event.order_id);
     }
     ASSERT_TRUE(expect_match("full page", books, live));
-    EXPECT_EQ(books.paged.page_stats().live_leaves, 1u);
+    EXPECT_EQ(books.paged.page_stats().live_leaves, 2u);
 
     BookEvent drop;
     drop.type = EventType::Cancel;
@@ -355,7 +322,7 @@ TEST(PriceIndex, EmptyPageReuseAndRollback) {
     add.qty = 3;
     ASSERT_TRUE(apply_both(add));
     const auto after_hot = paged.page_stats();
-    EXPECT_EQ(after_hot.live_leaves, 0u);
+    EXPECT_EQ(after_hot.live_leaves, 1u);
 
     BookEvent far;
     far.type = EventType::Add;
@@ -365,15 +332,15 @@ TEST(PriceIndex, EmptyPageReuseAndRollback) {
     far.qty = 1;
     ASSERT_TRUE(apply_both(far));
     const auto after_first = paged.page_stats();
-    EXPECT_EQ(after_first.live_leaves, 1u);
-    EXPECT_GT(after_first.committed_nodes, 1u);
+    EXPECT_EQ(after_first.live_leaves, 2u);
+    EXPECT_GT(after_first.committed_nodes, 2u);
 
     BookEvent cancel;
     cancel.type = EventType::Cancel;
     cancel.order_id = 2;
     ASSERT_TRUE(apply_both(cancel));
     const auto after_cancel = paged.page_stats();
-    EXPECT_EQ(after_cancel.live_leaves, 0u);
+    EXPECT_EQ(after_cancel.live_leaves, 1u);
     EXPECT_EQ(after_cancel.live_nodes, after_hot.live_nodes);
     EXPECT_EQ(after_cancel.committed_leaves, after_first.committed_leaves);
     EXPECT_EQ(after_cancel.committed_nodes, after_first.committed_nodes);
@@ -382,7 +349,7 @@ TEST(PriceIndex, EmptyPageReuseAndRollback) {
     far.price = -200000;
     ASSERT_TRUE(apply_both(far));
     const auto after_reuse = paged.page_stats();
-    EXPECT_EQ(after_reuse.live_leaves, 1u);
+    EXPECT_EQ(after_reuse.live_leaves, 2u);
     EXPECT_EQ(after_reuse.committed_leaves, after_first.committed_leaves);
     EXPECT_EQ(after_reuse.committed_nodes, after_first.committed_nodes);
     EXPECT_EQ(reference.level_qty(Side::Buy, -200000), map_book.level_qty(Side::Buy, -200000));
@@ -437,7 +404,7 @@ TEST(PriceIndex, Int64MinIsARealPriceOnTheNewBooks) {
     apply(3, Side::Sell, min_price, 6);
     apply(4, Side::Sell, 0, 7);
     EXPECT_EQ(tick_page_key(min_price), tick_page_key(min_price + 255));
-    EXPECT_EQ(paged.page_stats().live_leaves, 1u);
+    EXPECT_EQ(paged.page_stats().live_leaves, 3u);
 
     LevelView bids[4];
     LevelView asks[4];

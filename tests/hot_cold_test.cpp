@@ -10,13 +10,13 @@ using fastlob::Price;
 using fastlob::Qty;
 using fastlob::Side;
 
-TEST(HotCold, NearBestStaysOffTheRadix) {
+TEST(HotCold, NearBestStaysInSingleLeaf) {
     constexpr int kHot = fastlob::PagedPriceIndex<>::kHotTicks;
     PagedLOB book(2048, 2048);
     for (int i = 0; i < kHot; ++i) {
         ASSERT_TRUE(book.add(static_cast<fastlob::OrderId>(i + 1), Side::Sell, i, 1));
     }
-    EXPECT_EQ(book.page_stats().live_leaves, 0u);
+    EXPECT_EQ(book.page_stats().live_leaves, 1u);
     EXPECT_EQ(book.best_price(Side::Sell), 0);
     EXPECT_EQ(book.active_levels(Side::Sell), static_cast<std::size_t>(kHot));
 }
@@ -27,12 +27,12 @@ TEST(HotCold, FarLevelsUsePages) {
     for (int i = 0; i < kHot + 64; ++i) {
         ASSERT_TRUE(book.add(static_cast<fastlob::OrderId>(i + 1), Side::Sell, i, 1));
     }
-    EXPECT_EQ(book.page_stats().live_leaves, 1u);
+    EXPECT_EQ(book.page_stats().live_leaves, 2u);
     EXPECT_EQ(book.level_qty(Side::Sell, kHot + 8), 1u);
 
     ASSERT_TRUE(book.cancel(1));
     EXPECT_EQ(book.best_price(Side::Sell), 1);
-    EXPECT_EQ(book.page_stats().live_leaves, 1u);
+    EXPECT_EQ(book.page_stats().live_leaves, 2u);
 }
 
 TEST(HotCold, PromoteIntoWindowOnBestMove) {
@@ -41,12 +41,12 @@ TEST(HotCold, PromoteIntoWindowOnBestMove) {
     for (int i = 0; i < kHot + 16; ++i) {
         ASSERT_TRUE(book.add(static_cast<fastlob::OrderId>(i + 1), Side::Sell, i, 1));
     }
-    EXPECT_EQ(book.page_stats().live_leaves, 1u);
+    EXPECT_EQ(book.page_stats().live_leaves, 2u);
     for (int i = 0; i < 16; ++i) {
         ASSERT_TRUE(book.cancel(static_cast<fastlob::OrderId>(i + 1)));
     }
     EXPECT_EQ(book.best_price(Side::Sell), 16);
-    EXPECT_EQ(book.page_stats().live_leaves, 0u);
+    EXPECT_EQ(book.page_stats().live_leaves, 2u);
     EXPECT_EQ(book.level_qty(Side::Sell, kHot + 15), 1u);
 }
 
@@ -99,7 +99,32 @@ TEST(HotCold, FailedBetterOpenRollsBack) {
     EXPECT_EQ(tight.order_count(), 1u);
     EXPECT_EQ(tight.best_price(Side::Buy), 10);
     EXPECT_EQ(tight.level_qty(Side::Buy, 10), 1u);
-    EXPECT_EQ(tight.page_stats().live_leaves, 0u);
+    EXPECT_EQ(tight.page_stats().live_leaves, 1u);
+}
+
+TEST(HotCold, ZeroMigrationUnderAdversarialSpikes) {
+    PagedLOB book(4096, 4096);
+    book.reserve_cold(16, 16);
+    // Populate 200 dense resting Buy levels at [10'000 .. 10'199]
+    for (int i = 0; i < 200; ++i) {
+        ASSERT_TRUE(book.add(static_cast<fastlob::OrderId>(i + 1), Side::Buy, 10'000 + i, 5));
+    }
+    const auto baseline = book.page_stats();
+    // Repeatedly insert & cancel transient spikes +15,000 ticks ahead of best bid
+    for (int iter = 0; iter < 2000; ++iter) {
+        const fastlob::OrderId spike_id = 50'000 + static_cast<fastlob::OrderId>(iter);
+        const Price spike_px = 25'000 + (iter % 512);
+        ASSERT_TRUE(book.add(spike_id, Side::Buy, spike_px, 1));
+        EXPECT_EQ(book.best_price(Side::Buy), spike_px);
+        ASSERT_TRUE(book.cancel(spike_id));
+        EXPECT_EQ(book.best_price(Side::Buy), 10'199);
+    }
+    const auto after = book.page_stats();
+    EXPECT_EQ(after.committed_nodes, baseline.committed_nodes);
+    EXPECT_EQ(after.committed_leaves, baseline.committed_leaves);
+    EXPECT_EQ(after.live_leaves, baseline.live_leaves);
+    EXPECT_EQ(book.level_qty(Side::Buy, 10'000), 5u);
+    EXPECT_EQ(book.level_qty(Side::Buy, 10'199), 5u);
 }
 
 TEST(HotCold, Int64ExtremesAndLargeLevelQty) {
