@@ -22,6 +22,12 @@ __pycache__/
 .venv/
 *.egg-info/
 
+# Market data feeds & slices (never committed)
+data/
+*.itch
+*.itch.gz
+*NASDAQ_ITCH50*
+
 # Local prep notes stay untracked. The architecture write-up is published.
 docs/*
 !docs/pagedlob-architecture.md
