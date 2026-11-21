@@ -6,8 +6,9 @@
 namespace fastlob {
 
 using OrderId = std::uint64_t;
-using Price = std::int64_t;   // fixed-point ticks
-using Qty = std::uint32_t;
+using Price = std::int64_t;     // fixed-point ticks
+using Qty = std::uint32_t;      // per-order quantity
+using LevelQty = std::uint64_t; // aggregate quantity on a price level
 using Timestamp = std::uint64_t;
 
 /// Tick size: 1 tick = 0.01 currency units (cents).
@@ -36,7 +37,7 @@ struct BookEvent {
 
 struct LevelView {
     Price price{0};
-    Qty qty{0};
+    LevelQty qty{0};
 };
 
 struct Fill {

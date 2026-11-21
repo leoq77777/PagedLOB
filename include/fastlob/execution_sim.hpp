@@ -1,6 +1,6 @@
 #pragma once
 
-#include "fastlob/lob_fast.hpp"
+#include "fastlob/storage_book.hpp"
 #include "fastlob/types.hpp"
 
 #include <algorithm>
@@ -26,15 +26,17 @@ struct ShadowOrder {
     Price price{0};
     Qty qty{0};
     Qty remaining{0};
-    Qty ahead_qty{0};
+    LevelQty ahead_qty{0};
     bool active{false};
 };
 
 /// Strategy execution against a read-only public book + trade stream.
-/// Shadow limit orders never enter the public FIFO.
+/// Shadow limit orders never enter the public FIFO. Defaults to `PagedLOB`,
+/// and also deduces `FastOrderBook` or `ReferenceOrderBook` via C++20 CTAD.
+template <typename Book = PagedLOB>
 class ExecutionSimulator {
 public:
-    explicit ExecutionSimulator(const FastOrderBook& book) : book_(book) {}
+    explicit ExecutionSimulator(const Book& book) : book_(book) {}
 
     /// Place shadow limit; records ahead_qty from public level total.
     bool submit_limit(OrderId id, Side side, Price price, Qty qty) {
@@ -74,7 +76,7 @@ public:
         std::int64_t notional_ticks = 0;
         Qty filled = 0;
         for (std::size_t i = 0; i < n && left > 0; ++i) {
-            const Qty take = std::min(left, levels[i].qty);
+            const Qty take = static_cast<Qty>(std::min<LevelQty>(left, levels[i].qty));
             notional_ticks += static_cast<std::int64_t>(take) * levels[i].price;
             filled += take;
             left -= take;
@@ -93,7 +95,6 @@ public:
     }
 
     /// Observe a public trade at `price` for `qty` on the trade's aggressor-consumed side.
-    /// For queue tracking: trades that lift offers consume ask-side ahead; hits consume bids.
     /// `resting_side` is the side of the book that was resting and got executed.
     void on_public_trade(Side resting_side, Price price, Qty qty, Timestamp ts = 0) {
         for (auto& s : shadows_) {
@@ -103,14 +104,14 @@ public:
             if (s.side != resting_side || s.price != price) {
                 continue;
             }
-            Qty trade_left = qty;
+            LevelQty trade_left = qty;
             if (s.ahead_qty > 0) {
-                const Qty consume = std::min(s.ahead_qty, trade_left);
+                const LevelQty consume = std::min<LevelQty>(s.ahead_qty, trade_left);
                 s.ahead_qty -= consume;
                 trade_left -= consume;
             }
             if (trade_left > 0 && s.ahead_qty == 0) {
-                const Qty fill_qty = std::min(s.remaining, trade_left);
+                const Qty fill_qty = static_cast<Qty>(std::min<LevelQty>(s.remaining, trade_left));
                 s.remaining -= fill_qty;
                 FillReport fr;
                 fr.strategy_order_id = s.id;
@@ -161,9 +162,12 @@ private:
         return nullptr;
     }
 
-    const FastOrderBook& book_;
+    const Book& book_;
     std::vector<ShadowOrder> shadows_;
     std::vector<FillReport> last_fills_;
 };
+
+template <typename Book>
+ExecutionSimulator(const Book&) -> ExecutionSimulator<Book>;
 
 }  // namespace fastlob

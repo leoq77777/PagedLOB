@@ -1,5 +1,5 @@
 #include "fastlob/execution_sim.hpp"
-#include "fastlob/lob_fast.hpp"
+#include "fastlob/storage_book.hpp"
 #include "fastlob/synthetic_mbo.hpp"
 #include "fastlob/types.hpp"
 
@@ -21,10 +21,30 @@ struct SnapshotBuffer {
 class PyOrderBook {
 public:
     explicit PyOrderBook(std::size_t max_orders = 1 << 20)
-        : book_(std::make_unique<fastlob::FastOrderBook>(max_orders, max_orders / 8)) {}
+        : book_(std::make_unique<fastlob::PagedLOB>(max_orders, max_orders / 8)) {}
 
     bool add(std::uint64_t id, int side, std::int64_t price, std::uint32_t qty) {
         return book_->add(id, static_cast<fastlob::Side>(side), price, qty);
+    }
+
+    py::dict match_limit(std::uint64_t id, int side, std::int64_t price, std::uint32_t qty) {
+        const auto res = book_->match_limit(id, static_cast<fastlob::Side>(side), price, qty);
+        py::dict d;
+        d["ok"] = res.ok;
+        d["filled"] = res.filled;
+        d["remaining"] = res.remaining;
+        d["rested"] = res.rested;
+        return d;
+    }
+
+    py::dict match_market(std::uint64_t id, int side, std::uint32_t qty) {
+        const auto res = book_->match_market(id, static_cast<fastlob::Side>(side), qty);
+        py::dict d;
+        d["ok"] = res.ok;
+        d["filled"] = res.filled;
+        d["remaining"] = res.remaining;
+        d["rested"] = res.rested;
+        return d;
     }
 
     bool cancel(std::uint64_t id) { return book_->cancel(id); }
@@ -43,10 +63,10 @@ public:
         return buf;
     }
 
-    fastlob::FastOrderBook& native() { return *book_; }
+    fastlob::PagedLOB& native() { return *book_; }
 
 private:
-    std::unique_ptr<fastlob::FastOrderBook> book_;
+    std::unique_ptr<fastlob::PagedLOB> book_;
 };
 
 class PyExecutionSimulator {
@@ -77,13 +97,13 @@ public:
     std::size_t fill_count() const { return sim_.fills().size(); }
 
 private:
-    fastlob::ExecutionSimulator sim_;
+    fastlob::ExecutionSimulator<fastlob::PagedLOB> sim_;
 };
 
 }  // namespace
 
 PYBIND11_MODULE(pyfastlob, m) {
-    m.doc() = "FastLOB Python bindings (zero-copy snapshot buffer export)";
+    m.doc() = "PagedLOB Python bindings (zero-copy snapshot buffer export)";
     m.attr("SIDE_BUY") = 0;
     m.attr("SIDE_SELL") = 1;
     m.attr("TICK_SIZE_FACTOR") = fastlob::kTickSizeFactor;
@@ -118,6 +138,8 @@ PYBIND11_MODULE(pyfastlob, m) {
     py::class_<PyOrderBook>(m, "OrderBook")
         .def(py::init<std::size_t>(), py::arg("max_orders") = (1 << 20))
         .def("add", &PyOrderBook::add)
+        .def("match_limit", &PyOrderBook::match_limit)
+        .def("match_market", &PyOrderBook::match_market)
         .def("cancel", &PyOrderBook::cancel)
         .def("modify", &PyOrderBook::modify)
         .def("execute", &PyOrderBook::execute)

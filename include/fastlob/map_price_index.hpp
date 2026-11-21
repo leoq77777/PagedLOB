@@ -89,6 +89,13 @@ public:
         return it->second;
     }
 
+    [[nodiscard]] BookLevel* find_or_open(Price price) {
+        if (BookLevel* existing = find(price)) {
+            return existing;
+        }
+        return open(price);
+    }
+
     [[nodiscard]] BookLevel* open(Price price) {
         BookLevel* level = pool_->acquire(price, side_);
         if (level == nullptr) {
@@ -126,15 +133,17 @@ public:
         std::size_t n = 0;
         if (side_ == Side::Sell) {
             for (auto it = map_.begin(); it != map_.end() && n < out.size(); ++it) {
-                out[n++] = LevelView{it->first, narrow_qty(it->second->total_qty)};
+                out[n++] = LevelView{it->first, it->second->total_qty};
             }
         } else {
             for (auto it = map_.rbegin(); it != map_.rend() && n < out.size(); ++it) {
-                out[n++] = LevelView{it->first, narrow_qty(it->second->total_qty)};
+                out[n++] = LevelView{it->first, it->second->total_qty};
             }
         }
         return n;
     }
+
+    void reserve(std::size_t /*nodes*/, std::size_t /*leaves*/) {}
 
     /// Bytes currently held by map nodes (released back to the allocator on erase).
     [[nodiscard]] std::size_t bytes() const { return counter_.live; }
@@ -144,11 +153,6 @@ public:
     [[nodiscard]] BookLevel* best() const { return best_; }
 
 private:
-    static Qty narrow_qty(std::uint64_t qty) {
-        assert(qty <= std::numeric_limits<Qty>::max());
-        return static_cast<Qty>(qty);
-    }
-
     [[nodiscard]] bool is_better(Price candidate, Price incumbent) const {
         return side_ == Side::Buy ? candidate > incumbent : candidate < incumbent;
     }

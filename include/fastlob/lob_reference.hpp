@@ -98,13 +98,13 @@ public:
         return *it->second.iter;
     }
 
-    [[nodiscard]] Qty level_qty(Side side, Price price) const {
+    [[nodiscard]] LevelQty level_qty(Side side, Price price) const {
         const auto& m = levels_c(side);
         auto it = m.find(price);
         if (it == m.end()) {
             return 0;
         }
-        Qty sum = 0;
+        LevelQty sum = 0;
         for (const auto& o : it->second) {
             sum += o.qty;
         }
@@ -118,7 +118,7 @@ public:
         std::size_t n = 0;
         if (side == Side::Buy) {
             for (auto it = m.rbegin(); it != m.rend() && n < out.size(); ++it) {
-                Qty q = 0;
+                LevelQty q = 0;
                 for (const auto& o : it->second) {
                     q += o.qty;
                 }
@@ -129,7 +129,7 @@ public:
             }
         } else {
             for (auto it = m.begin(); it != m.end() && n < out.size(); ++it) {
-                Qty q = 0;
+                LevelQty q = 0;
                 for (const auto& o : it->second) {
                     q += o.qty;
                 }
