@@ -1,6 +1,6 @@
 # PagedLOB 架构说明与版本演进
 
-本文描述 **v0.3.0** 的 `fastlob::PagedLOB`（含 256-tick **hot window + 物理位图**、**冷区有序双向叶链** 与 **单数组单次探测 `OrderIdIndex`**）。定位是一份自包含的架构设计、基准评测与版本演进文档。
+本文描述 **v0.4.0** 的 `fastlob::PagedLOB`（含 256-tick **hot window + 物理位图**、**冷区有序双向叶链**、**单数组单次探测 `OrderIdIndex`** 以及 **NASDAQ TotalView-ITCH 5.0 真实行情流式回放器与 Linux PMU 硬件计数器集成**）。定位是一份自包含的架构设计、基准评测与版本演进文档。
 
 对照数字全部来自 **2026-11-21（America/New_York, EST）** 在本仓库 Release 二进制上重跑的结果，见 [§4](#4-benchmark)；历史每次版本改动及指标变化见 [§8 版本演进日志（Changelog）](#8-版本演进日志changelog)。
 
@@ -302,6 +302,37 @@ flowchart TB
 | `sweep_in_page` | 6,320 B | 39.4 KB | 39.3 KB | 32.8 KB | 70.1 KB |
 | `sparse_jump` | 11.16 MB | 11.42 MB | 360.5 KB | 131.1 KB | 426.0 KB |
 
+### 4.7 真实市场全天回放基准（NASDAQ TotalView-ITCH 5.0，`itch_replay_bench`）
+
+为验证热冷分层假设与引擎在真实微观结构下的表现，`include/fastlob/itch50.hpp` 实现了零拷贝大端二进制 **NASDAQ TotalView-ITCH 5.0** 解析与状态归一化器（`ItchSymbolNormalizer`），支持 `.gz` 流式解压（`zlib`）与单趟多标的解复用（`locate_map[65536]` $O(1)$ 分发）：
+
+- **协议消息映射**：解析 `'S'`（开收盘系统事件）、`'R'`（Stock Directory 动态绑定 `stock_locate`）、`'A'/'F'`（Add Order → `Add`）、`'X'`（Order Cancel 部分撤单扣减股数 → 剩余 `>0` 发 `Modify`，归零发 `Cancel`）、`'D'`（Order Delete → `Cancel`）、`'E'/'C'`（Order Executed → `Execute`）、`'U'`（Order Replace 继承原单买卖方向 → `Cancel(orig)` + `Add(new)`），默认 `tick_divisor=100` 将 4 位隐含小数（`$0.0001`）无损映射至美股 `$0.01` 标准 tick。
+- **真实数据集**：NASDAQ 官方历史全天样本 **`12302019.NASDAQ_ITCH50.gz`**（2019-12-30 完整交易日，压缩包 `3.52 GB`，共 **268,744,780 条** wire 消息，流式解析速率 `8.60 M wire msgs/s`）。
+- **四簿全天逐日差分验证**：在 `AAPL`（`1,609,147` 事件，峰值活跃挂单 `27,110`）、`SPY`（`2,249,458` 事件，峰值活跃挂单 `1,949`）、`MSFT`（`1,270,785` 事件，峰值活跃挂单 `23,005`）合计 **5,129,390 条真实 L3 订单簿事件**上，`PagedLOB`、`MapStorageBook`（`std::map`）、`FastOrderBook`（`v1`）与 `ReferenceOrderBook`（`std::map + std::list`）在日内 100 个等距检查点及收盘时刻的 `order_count`、BBO 与买卖前 10 档 L2 深度 **100% 逐位一致**。
+- **256-tick（`$2.56`）热环命中率实证**：真实行情下，`SPY`（中枢价 `$321.30`）**91.48%**、`MSFT`（`$157.89`）**88.28%**、`AAPL`（`$290.25`，散户远端挂单深）**75.08%** 的新增挂单直接命中 1,056B 热环，无需触碰冷区基数树。
+
+单核绑核（`taskset -c 0`，`g++-13 -O3 -DNDEBUG`，预热 1 轮 + 正式测量 5 轮，`batch=128`）实测结果：
+
+| 标的 | 订单簿实现 | 全天事件数 | 热环命中率 | Mops/s | p50 (ns) | p99 (ns) | p99.9 (ns) | 全天 6.5h 回放耗时 |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| **AAPL** | **PagedLOB** | 1,609,147 | 75.08% | **37.28** | **25.7** | **37.8** | **102.7** | **43.2 ms** |
+| AAPL | `std::map` (`MapStorageBook`) | 1,609,147 | — | 21.79 | 44.6 | 68.1 | 128.4 | 73.8 ms |
+| AAPL | `ref_map_list` | 1,609,147 | — | 11.27 | 86.9 | 121.5 | 177.1 | 142.7 ms |
+| AAPL | `v1` (`FastOrderBook`) | 1,609,147 | — | 7.30 | 122.4 | 338.0 | 2,397.4 | 220.6 ms |
+| **SPY** | **PagedLOB** | 2,249,458 | 91.48% | **53.26** | **17.5** | **30.2** | **90.4** | **42.2 ms** |
+| SPY | `v1` (`FastOrderBook`) | 2,249,458 | — | 42.32 | 23.2 | 40.6 | 103.1 | 53.2 ms |
+| SPY | `std::map` (`MapStorageBook`) | 2,249,458 | — | 37.27 | 25.0 | 62.5 | 109.5 | 60.4 ms |
+| SPY | `ref_map_list` | 2,249,458 | — | 14.89 | 65.1 | 102.4 | 180.7 | 151.1 ms |
+| **MSFT** | **PagedLOB** | 1,270,785 | 88.28% | **42.32** | **22.2** | **33.8** | **109.1** | **30.0 ms** |
+| MSFT | `std::map` (`MapStorageBook`) | 1,270,785 | — | 28.80 | 32.8 | 60.0 | 114.0 | 44.1 ms |
+| MSFT | `v1` (`FastOrderBook`) | 1,270,785 | — | 20.15 | 36.2 | 178.2 | 2,016.6 | 63.1 ms |
+| MSFT | `ref_map_list` | 1,270,785 | — | 11.91 | 81.0 | 125.2 | 189.9 | 106.7 ms |
+
+关键观察：
+- **在全部三只代表性标的上，`PagedLOB` 均在 **30~43 ms** 内复现完整个 6.5 小时交易日行情**（吞吐 **37.3~53.3 Mops/s**）。
+- 在挂单档位极深的 `AAPL` 上，平面结构 `v1` 因远端开新档线性扫描退化至 `7.30 Mops/s` 且 `p99.9` 飙升至 `2,397.4 ns`；`PagedLOB` 依靠冷区页式基数树与双向叶链实现 **5.11× 吞吐提升** 与 **23.3× `p99.9` 长尾延迟压缩**（`102.7 ns`），同时较同池化 `std::map` 快 **1.71×**。
+- **裸金属硬件 PMU 采样**：`bench/perf_counters.hpp` 通过 Linux `perf_event_open` 仅包裹纯热循环（零文件加载噪声），在开放硬件 PMU 的物理机或 WSL 上执行 `./scripts/run_remote_perf.sh <ssh-host> [--download-itch]` 即可一键输出 `cycles/ev`、`IPC`、`L1d-load-misses/1k` 与 `LLC-load-misses/1k` 表格。
+
 ---
 
 ## 5. 当前已知边界与后续演进方向
@@ -355,6 +386,14 @@ flowchart TB
 ## 8. 版本演进日志（Changelog）
 
 > **文档维护约定**：每次对 `PagedLOB` 数据结构、关键路径、API 或基准测试做版本改动时，必须同步更新正文对应章节，并在本节顶部或底部追加一条版本记录（含日期、版本号/提交、核心改动与关键基准变化）。
+
+### v0.4.0 — 2026-11-21（America/New_York, EST）
+- **真实市场全天回放与协议解析（NASDAQ TotalView-ITCH 5.0）**：
+  - 新增零拷贝头文件解析库 `include/fastlob/itch50.hpp`：完整支持 ITCH 5.0 `'S'/'R'/'A'/'F'/'X'/'D'/'E'/'C'/'U'` 消息线格式解析、`.gz` 流式解压（`zlib`）及单标的/多标的 $O(1)$ `stock_locate` 分发状态机 `ItchSymbolNormalizer`（处理 `'X'` 部分撤单转 `Modify`/`Cancel` 与 `'U'` 改单继承原单买卖方向转 `Cancel+Add`）。
+  - 新增全天真实行情回放与差分校验基准 `bench/itch_replay_bench.cpp` 及单元测试 `tests/itch50_test.cpp`。在官方 `12302019.NASDAQ_ITCH50.gz`（2.687 亿条 wire 消息）提取的 `AAPL`、`SPY`、`MSFT` 共 **5,129,390 条真实 L3 事件**上，验证四套订单簿 100 个日内检查点 + 收盘状态 100% 一致；实证 256-tick 热环命中率达 **75.08%~91.48%**，单核回放吞吐达 **37.28~53.26 Mops/s**（`p50 = 17.5~25.7 ns`，单只标的全天 6.5 小时行情 **30.0~43.2 ms** 回放完毕，在深盘口 `AAPL` 上较 `v1` 提速 **5.11×**、`p99.9` 降低 **23.3×**）。
+- **Linux 硬件 PMU 计数器与远程裸机一键评测**：
+  - 新增 `bench/perf_counters.hpp`（基于 `perf_event_open` 精确包裹基准热循环，采集 `cycles`、`instructions`、`IPC`、`branch-misses`、`L1d-load-misses`、`LLC-load-misses`）并接入 `price_index_bench` 与 `itch_replay_bench`。
+  - 新增 `scripts/run_remote_perf.sh`，通过 `git archive` 免鉴权同步源码至指定 SSH 主机并自动编译采集硬件 PMU 与 ITCH 5.0 基准。
 
 ### v0.3.0 — 2026-11-21（America/New_York, EST）
 - **核心性能改进**：

@@ -1,6 +1,6 @@
 # PagedLOB
 
-**PagedLOB is a C++20 high-update-rate, zero-hot-allocation in-memory L3 limit order book (v0.3.0).** The nearest 256 ticks from `best_` sit in a bitmap-indexed hot handle ring (`hot_handle_[256]` + physical occupancy bitmap `hot_occ_[4]`); deeper prices live on `2^PageBits`-tick cold leaves (default `PageBits=8`, 256 ticks) indexed by an 8-bit radix tree for point lookups and linked into a cache-line-packed sorted doubly-linked leaf list for O(1) cold-to-hot promotion and fast cross-page depth sweeps.
+**PagedLOB is a C++20 high-update-rate, zero-hot-allocation in-memory L3 limit order book (v0.4.0).** The nearest 256 ticks from `best_` sit in a bitmap-indexed hot handle ring (`hot_handle_[256]` + physical occupancy bitmap `hot_occ_[4]`); deeper prices live on `2^PageBits`-tick cold leaves (default `PageBits=8`, 256 ticks) indexed by an 8-bit radix tree for point lookups and linked into a cache-line-packed sorted doubly-linked leaf list for O(1) cold-to-hot promotion and fast cross-page depth sweeps. Includes a native streaming **NASDAQ TotalView-ITCH 5.0** binary parser & normalizer (`include/fastlob/itch50.hpp`).
 
 The primary C++ type is `fastlob::PagedLOB` (`StorageBook<PagedPriceIndex<8, 256>>`, customizable via `PagedStorageBookT<PageBits, HotTicks>`). Full architecture notes, engineering review closure, and version-by-version changelog: [docs/pagedlob-architecture.md](docs/pagedlob-architecture.md).
 
@@ -32,13 +32,34 @@ Benchmarks (Release, `-O3 -DNDEBUG`):
 ./build/price_index_bench
 ./build/page_param_sweep
 ./build/fastlob_latency_hist
+./build/itch_replay_bench /path/to/12302019.NASDAQ_ITCH50.gz --symbols=AAPL,SPY,MSFT
+# Or run bare-metal Linux perf_event_open PMU + ITCH benchmarks over SSH:
+./scripts/run_remote_perf.sh <ssh-host> [--download-itch]
 ```
 
 Sanitizers: `-DFASTLOB_SANITIZER=asan+ubsan -DFASTLOB_ENABLE_ALLOC_PROBE=OFF` (or `asan` / `ubsan` / `tsan`).
 
-## Benchmarks (v0.3.0)
+## Benchmarks (v0.4.0)
 
-Measured on **2026-11-21 (America/New_York, EST)**: KVM 4 vCPU Intel Xeon (`Intel(R) Xeon(R) Processor`, Family 6 Model 207), `g++-13` 13.3.0, CMake Release (`-O3 -DNDEBUG`, C++20, no `-march`). Timer: `std::chrono::steady_clock`; reported numbers are **p50 of per-batch means** pooled across 5 reps.
+Measured on **2026-11-21 (America/New_York, EST)**: KVM 4 vCPU Intel Xeon (`Intel(R) Xeon(R) Processor`, Family 6 Model 207), `g++-13` 13.3.0, CMake Release (`-O3 -DNDEBUG`, C++20, no `-march`). Timer: `std::chrono::steady_clock`; reported numbers are **p50 / p99 / p99.9 of per-batch means** pooled across 5 reps.
+
+### Real Market Replay — NASDAQ TotalView-ITCH 5.0 (`itch_replay_bench`)
+
+Full-day replay of official **`12302019.NASDAQ_ITCH50.gz`** (`268,744,780` wire messages streamed at `8.60 M wire msgs/s`; `5,129,390` normalized L3 `BookEvent`s across `AAPL`, `SPY`, and `MSFT`, verified 100% differentially across `PagedLOB`, `MapStorageBook`, `FastOrderBook`, and `ReferenceOrderBook` at 100 intraday checkpoints + EOD; `taskset -c 0`, `batch=128`, 1 warmup + 5 timed reps):
+
+| Symbol | Book | Full-Day Events | 256-Tick Hot Hit % | Mops/s | p50 (ns) | p99 (ns) | p99.9 (ns) | 6.5h Day Replay |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **SPY** | **PagedLOB** | 2,249,458 | **91.48%** | **53.26** | **17.5** | **30.2** | **90.4** | **42.2 ms** |
+| SPY | `v1` (flat) | 2,249,458 | — | 42.32 | 23.2 | 40.6 | 103.1 | 53.2 ms |
+| SPY | `std::map` | 2,249,458 | — | 37.27 | 25.0 | 62.5 | 109.5 | 60.4 ms |
+| SPY | `ref_map_list` | 2,249,458 | — | 14.89 | 65.1 | 102.4 | 180.7 | 151.1 ms |
+| **MSFT** | **PagedLOB** | 1,270,785 | **88.28%** | **42.32** | **22.2** | **33.8** | **109.1** | **30.0 ms** |
+| MSFT | `std::map` | 1,270,785 | — | 28.80 | 32.8 | 60.0 | 114.0 | 44.1 ms |
+| MSFT | `v1` (flat) | 1,270,785 | — | 20.15 | 36.2 | 178.2 | 2016.6 | 63.1 ms |
+| **AAPL** | **PagedLOB** | 1,609,147 | **75.08%** | **37.28** | **25.7** | **37.8** | **102.7** | **43.2 ms** |
+| AAPL | `std::map` | 1,609,147 | — | 21.79 | 44.6 | 68.1 | 128.4 | 73.8 ms |
+| AAPL | `ref_map_list` | 1,609,147 | — | 11.27 | 86.9 | 121.5 | 177.1 | 142.7 ms |
+| AAPL | `v1` (flat) | 1,609,147 | — | 7.30 | 122.4 | 338.0 | 2397.4 | 220.6 ms |
 
 ### PagedLOB vs Public Order Books (`external_compare_bench`)
 
@@ -98,7 +119,7 @@ python/            # pybind11 module + demo (binds PagedLOB + ExecutionSimulator
 
 ## Limitations
 
-- Single-threaded, single-instrument, in-memory only
-- Feed is synthetic MBO only; no self-trade prevention (STP) or hidden/iceberg orders
-- `modify` supports qty decrease only (price change = cancel + add)
+- Single-threaded, single-instrument per book instance, in-memory only
+- No self-trade prevention (STP) or hidden/iceberg orders
+- `modify` supports qty decrease only (price change = cancel + add, matching ITCH 5.0 `'X'` vs `'U'`)
 - Pathological 64-bit sparse far-from-touch jumps (`sparse_jump`) still allocate uncompressed 7-level radix nodes (see [docs/pagedlob-architecture.md](docs/pagedlob-architecture.md) §5 & §8)
