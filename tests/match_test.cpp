@@ -141,3 +141,72 @@ TEST(Match, PagedAndMapAgreeOnWalk) {
     EXPECT_EQ(paged.best_price(Side::Sell), map_book.best_price(Side::Sell));
     EXPECT_EQ(paged.best_price(Side::Buy), map_book.best_price(Side::Buy));
 }
+
+TYPED_TEST(MatchBook, MarketEmptyAndDuplicateIdEdgeCases) {
+    const auto empty_res = this->book.match_market(1, Side::Buy, 10);
+    EXPECT_TRUE(empty_res.ok);
+    EXPECT_EQ(empty_res.filled, 0u);
+    EXPECT_EQ(empty_res.remaining, 10u);
+    EXPECT_FALSE(empty_res.rested);
+
+    ASSERT_TRUE(this->book.add(10, Side::Sell, 100, 5));
+    const auto dup_limit = this->book.match_limit(10, Side::Buy, 100, 3);
+    EXPECT_FALSE(dup_limit.ok);
+    EXPECT_EQ(this->book.level_qty(Side::Sell, 100), 5u);
+
+    const auto dup_market = this->book.match_market(10, Side::Buy, 3);
+    EXPECT_FALSE(dup_market.ok);
+    EXPECT_EQ(this->book.level_qty(Side::Sell, 100), 5u);
+}
+
+TEST(Match, TightCapacityPartialAndDrainRest) {
+    PagedLOB tight(1, 1);
+    ASSERT_TRUE(tight.add(1, Side::Sell, 100, 10));
+
+    // Partial fill of maker: remaining == 0, does not need to rest even at 0 free slots.
+    const auto partial = tight.match_limit(2, Side::Buy, 100, 4);
+    EXPECT_TRUE(partial.ok);
+    EXPECT_EQ(partial.filled, 4u);
+    EXPECT_EQ(partial.remaining, 0u);
+    EXPECT_FALSE(partial.rested);
+    EXPECT_EQ(tight.level_qty(Side::Sell, 100), 6u);
+
+    // Non-crossing limit when OrderPool is full is rejected cleanly without mutation.
+    const auto rejected = tight.match_limit(3, Side::Buy, 95, 2);
+    EXPECT_FALSE(rejected.ok);
+    EXPECT_EQ(rejected.filled, 0u);
+    EXPECT_EQ(tight.level_qty(Side::Sell, 100), 6u);
+
+    // Over-filling drains Sell@100 (freeing the 1 Order + 1 BookLevel), then rests remaining 5.
+    const auto drain_rest = tight.match_limit(4, Side::Buy, 100, 11);
+    EXPECT_TRUE(drain_rest.ok);
+    EXPECT_EQ(drain_rest.filled, 6u);
+    EXPECT_EQ(drain_rest.remaining, 5u);
+    EXPECT_TRUE(drain_rest.rested);
+    EXPECT_EQ(tight.level_qty(Side::Buy, 100), 5u);
+}
+
+TEST(Match, FindScrubsInternalLinksAndFullIdIndexTerminates) {
+    PagedLOB book(16, 8);
+    ASSERT_TRUE(book.add(1, Side::Buy, 100, 5));
+    ASSERT_TRUE(book.add(2, Side::Buy, 100, 7));
+    const auto snap = book.find(1);
+    ASSERT_TRUE(snap.has_value());
+    EXPECT_EQ(snap->qty, 5u);
+    EXPECT_EQ(snap->prev, nullptr);
+    EXPECT_EQ(snap->next, nullptr);
+    EXPECT_EQ(snap->level_handle, 0u);
+
+    fastlob::OrderIdIndex idx(16);
+    fastlob::Order dummy{};
+    for (fastlob::OrderId id = 1; id <= 16; ++id) {
+        EXPECT_TRUE(idx.insert(id, &dummy));
+    }
+    std::size_t slot = 0;
+    EXPECT_FALSE(idx.find_empty_slot(99, slot));
+    EXPECT_FALSE(idx.insert(99, &dummy));
+    EXPECT_EQ(idx.find(99), nullptr);
+    EXPECT_EQ(idx.take(8), &dummy);
+    EXPECT_EQ(idx.find(8), nullptr);
+    EXPECT_EQ(idx.find(16), &dummy);
+}

@@ -6,4 +6,5 @@
 TEST(ExternalBooks, BrAvlMatchesFastLobDepth) {
     expect_books_agree<FastV1Book, BrBook>("br-v1");
     expect_books_agree<FastPagedBook, BrBook>("br-paged");
+    expect_crossing_books_agree<FastPagedBook, BrBook>("br-paged-cross");
 }

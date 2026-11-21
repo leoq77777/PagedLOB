@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - name: release-alloc-probe
+            build_type: Release
+            sanitizer: ""
+            alloc_probe: ON
+            bench: ON
+          - name: asan-ubsan
+            build_type: RelWithDebInfo
+            sanitizer: "asan+ubsan"
+            alloc_probe: OFF
+            bench: OFF
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (${{ matrix.config.name }})
+        run: |
+          cmake -B build \
+            -DCMAKE_CXX_COMPILER=g++-13 \
+            -DCMAKE_BUILD_TYPE=${{ matrix.config.build_type }} \
+            -DFASTLOB_SANITIZER=${{ matrix.config.sanitizer }} \
+            -DFASTLOB_ENABLE_ALLOC_PROBE=${{ matrix.config.alloc_probe }} \
+            -DFASTLOB_BUILD_BENCH=${{ matrix.config.bench }} \
+            -DFASTLOB_BUILD_PYTHON=OFF
+      - name: Build (${{ matrix.config.name }})
+        run: cmake --build build -j
+      - name: Test (${{ matrix.config.name }})
+        run: ctest --test-dir build --output-on-failure

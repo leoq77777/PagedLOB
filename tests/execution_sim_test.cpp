@@ -65,3 +65,23 @@ TEST(ExecutionSim, ShadowNeverInPublicFifo) {
     EXPECT_EQ(ids[0], 1u);
     EXPECT_FALSE(sim.shadow_in_public_book(42));
 }
+
+TEST(ExecutionSim, WorksWithPagedLOBDefault) {
+    fastlob::PagedLOB book(1024, 64);
+    const auto px = dollars_to_ticks(100.0);
+    ASSERT_TRUE(book.add(1, Side::Buy, px, 500));
+    ASSERT_TRUE(book.add(2, Side::Sell, dollars_to_ticks(100.10), 100));
+    ASSERT_TRUE(book.add(3, Side::Sell, dollars_to_ticks(100.20), 200));
+
+    ExecutionSimulator sim(book);
+    ASSERT_TRUE(sim.submit_limit(9001, Side::Buy, px, 100));
+    ASSERT_TRUE(book.execute(1, 500));
+    sim.on_public_trade(Side::Buy, px, 600);
+    ASSERT_EQ(sim.fills().size(), 1u);
+    EXPECT_EQ(sim.fills()[0].qty, 100u);
+
+    auto mkt = sim.submit_market(8001, Side::Buy, 250);
+    ASSERT_TRUE(mkt.has_value());
+    EXPECT_EQ(mkt->qty, 250u);
+    EXPECT_EQ(mkt->price, dollars_to_ticks(100.16));
+}

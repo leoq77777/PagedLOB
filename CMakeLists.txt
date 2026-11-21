@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(fastlob VERSION 0.2.0 LANGUAGES CXX)
+project(fastlob VERSION 0.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -58,14 +58,17 @@ add_executable(page_param_sweep bench/page_param_sweep.cpp)
 target_link_libraries(page_param_sweep PRIVATE fastlob)
 fastlob_apply_warnings(page_param_sweep)
 
-# ---- Sanitizer helpers (use -DFASTLOB_SANITIZER=asan|ubsan|tsan) ----
-set(FASTLOB_SANITIZER "" CACHE STRING "asan|ubsan|tsan")
+# ---- Sanitizer helpers (use -DFASTLOB_SANITIZER=asan|ubsan|asan+ubsan|tsan) ----
+set(FASTLOB_SANITIZER "" CACHE STRING "asan|ubsan|asan+ubsan|tsan")
 if(FASTLOB_SANITIZER STREQUAL "asan")
   add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
   add_link_options(-fsanitize=address)
 elseif(FASTLOB_SANITIZER STREQUAL "ubsan")
   add_compile_options(-fsanitize=undefined -fno-omit-frame-pointer)
   add_link_options(-fsanitize=undefined)
+elseif(FASTLOB_SANITIZER STREQUAL "asan+ubsan")
+  add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
+  add_link_options(-fsanitize=address,undefined)
 elseif(FASTLOB_SANITIZER STREQUAL "tsan")
   add_compile_options(-fsanitize=thread)
   add_link_options(-fsanitize=thread)

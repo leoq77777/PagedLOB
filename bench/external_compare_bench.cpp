@@ -38,7 +38,7 @@ int main() {
     std::cout << "prices are positive and fit in int32. Price 0 is avoided (Liquibook market sentinel).\n";
     std::cout << "exist/churn/sweep/sparse stay non-crossing. match_touch and match_walk8 go through "
                  "each book's matching path (PagedLOB::match_limit; others match inside add).\n";
-    std::cout << "v1 is not in this harness.\n";
+    std::cout << "v1 has no matching API, so it runs only the non-crossing workloads.\n";
 
     run_fastlob();
     run_liquibook();

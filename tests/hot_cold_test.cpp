@@ -101,3 +101,46 @@ TEST(HotCold, FailedBetterOpenRollsBack) {
     EXPECT_EQ(tight.level_qty(Side::Buy, 10), 1u);
     EXPECT_EQ(tight.page_stats().live_leaves, 0u);
 }
+
+TEST(HotCold, Int64ExtremesAndLargeLevelQty) {
+    const Price max_px = std::numeric_limits<Price>::max();
+    const Price min_px = std::numeric_limits<Price>::min();
+    PagedLOB book(64, 64);
+
+    // Hot window anchored near INT64_MAX on Sell and INT64_MIN on Buy without signed overflow.
+    ASSERT_TRUE(book.add(1, Side::Sell, max_px - 10, 3));
+    ASSERT_TRUE(book.add(2, Side::Sell, max_px, 4));
+    ASSERT_TRUE(book.add(3, Side::Buy, min_px + 10, 5));
+    ASSERT_TRUE(book.add(4, Side::Buy, min_px, 6));
+    EXPECT_EQ(book.best_price(Side::Sell), max_px - 10);
+    EXPECT_EQ(book.best_price(Side::Buy), min_px + 10);
+    ASSERT_TRUE(book.cancel(1));
+    ASSERT_TRUE(book.cancel(3));
+    EXPECT_EQ(book.best_price(Side::Sell), max_px);
+    EXPECT_EQ(book.best_price(Side::Buy), min_px);
+
+    // Aggregate level quantity exceeding UINT32_MAX is preserved in 64-bit LevelQty / LevelView.
+    const Qty big = 3'000'000'000u;
+    ASSERT_TRUE(book.add(10, Side::Buy, 500, big));
+    ASSERT_TRUE(book.add(11, Side::Buy, 500, big));
+    const fastlob::LevelQty expected = static_cast<fastlob::LevelQty>(big) * 2;
+    EXPECT_EQ(book.level_qty(Side::Buy, 500), expected);
+    fastlob::LevelView top[2];
+    ASSERT_GE(book.top_n(Side::Buy, top), 1u);
+    EXPECT_EQ(top[0].price, 500);
+    EXPECT_EQ(top[0].qty, expected);
+}
+
+TEST(HotCold, ColdMiddleLeafOrderPreserved) {
+    PagedLOB book(64, 64);
+    ASSERT_TRUE(book.add(1, Side::Sell, 0, 1));       // hot anchor
+    ASSERT_TRUE(book.add(2, Side::Sell, 10'000, 2));  // far cold max leaf
+    ASSERT_TRUE(book.add(3, Side::Sell, 1'000, 3));   // cold min leaf
+    ASSERT_TRUE(book.add(4, Side::Sell, 5'000, 4));   // middle cold leaf (via tree_successor)
+    std::vector<fastlob::LevelView> out(8);
+    ASSERT_EQ(book.top_n(Side::Sell, out), 4u);
+    EXPECT_EQ(out[0].price, 0);
+    EXPECT_EQ(out[1].price, 1'000);
+    EXPECT_EQ(out[2].price, 5'000);
+    EXPECT_EQ(out[3].price, 10'000);
+}

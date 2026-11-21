@@ -321,7 +321,7 @@ void bench_match_walk(const char* name) {
 }
 
 template <typename Book>
-void bench_all(const char* name) {
+void bench_noncrossing(const char* name) {
     bench_existing<Book>(name, false);
     bench_existing<Book>(name, true);
     bench_churn<Book>(name, 1000);
@@ -329,6 +329,11 @@ void bench_all(const char* name) {
     bench_sweep<Book>(name, "sweep_in_page", false);
     bench_sweep<Book>(name, "sweep_across", true);
     bench_sparse<Book>(name);
+}
+
+template <typename Book>
+void bench_all(const char* name) {
+    bench_noncrossing<Book>(name);
     bench_match_touch<Book>(name);
     bench_match_walk<Book>(name);
 }
