@@ -45,9 +45,9 @@ Sanitizers: `-DFASTLOB_SANITIZER=asan+ubsan -DFASTLOB_ENABLE_ALLOC_PROBE=OFF` (o
 
 Measured on **2026-11-21 (America/New_York, EST)**: KVM 4 vCPU Intel Xeon (`Intel(R) Xeon(R) Processor`, Family 6 Model 207), `g++-13` 13.3.0.
 
-### 1. Public `flash1-dev/matching-engine-benchmark` (5 Regimes, Worst-Case Ranked)
+### 1. Public `flash1-dev/matching-engine-benchmark` (5 Regimes, same-machine comparison)
 
-Evaluated via `adapters/matching_engine_benchmark/pagedlob_adapter.cpp` (zero external `g_side`/`g_price`/`g_slot_id` shadow arrays; **34/34** edge-case conformance checks `PASS`, **5/5** canonical SHA-256 report hashes + **960/960** book-state audits `PASS`, **50/50** random seed × scenario cells `PASS`; 5-trial median throughput in **M msgs/s** via `scripts/run_challenge.py --perf-runs 5 --compare`):
+Same-machine comparison on the KVM 4-vCPU Xeon host above; engines and the suite itself were selected by this project (not an official leaderboard). Evaluated via `adapters/matching_engine_benchmark/pagedlob_adapter.cpp` (zero external `g_side`/`g_price`/`g_slot_id` shadow arrays; **34/34** edge-case conformance checks `PASS`, **5/5** canonical SHA-256 report hashes + **960/960** book-state audits `PASS`, **50/50** random seed × scenario cells `PASS`; 5-trial median throughput in **M msgs/s** via `scripts/run_challenge.py --perf-runs 5 --compare`):
 
 | Engine | Structure | `static` | `normal` | `swing-25` | `swing-40` | `flash-crash` | **Worst-Case M/s** | Verdict |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
